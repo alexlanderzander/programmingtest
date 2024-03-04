@@ -1,0 +1,19 @@
+{
+  "name": "caesar",
+  "version": "1.0.0",
+  "description": "programmingtest",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexlanderzander/programmingtest.git"
+  },
+  "author": "me",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/alexlanderzander/programmingtest/issues"
+  },
+  "homepage": "https://github.com/alexlanderzander/programmingtest#readme"
+}

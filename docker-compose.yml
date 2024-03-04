@@ -1,0 +1,7 @@
+version: '3.8'
+services:
+  caesar:
+    build: .
+    volumes:
+      - .:/app
+    command: node app/index.js
