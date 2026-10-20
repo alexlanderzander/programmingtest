@@ -1,0 +1,36 @@
+name: Synthetic App Intents metadata oracle
+
+'on':
+  push:
+    branches: [main]
+    paths:
+      - indexedentity-oracle/**
+      - .github/workflows/indexedentity-oracle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: synthetic-appintents-oracle
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    if: github.repository == 'alexlanderzander/programmingtest'
+    runs-on: xcode-27
+    timeout-minutes: 10
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - name: Fetch this exact public repository commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init checkout
+          git -C checkout remote add origin https://github.com/alexlanderzander/programmingtest.git
+          git -C checkout fetch --depth=1 origin "$GITHUB_SHA"
+          git -C checkout checkout --detach FETCH_HEAD
+      - name: Build synthetic fixtures with genuine Apple metadata extraction
+        shell: bash
+        run: python3 checkout/indexedentity-oracle/run.py
