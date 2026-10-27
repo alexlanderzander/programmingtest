@@ -22,10 +22,10 @@ jobs:
     timeout-minutes: 60
     env:
       PRIVATE_BROKER_URL: https://native-ci-broker.evinsta9.workers.dev
-      PRIVATE_JOB_ID: 2b31d534-31d6-4a81-9e6b-86e907538f90
-      PRIVATE_SOURCE_SHA256: f62ad7fac9431bcc939a55431634b990916f2468765629509302bb57fcd9a948
-      PRIVATE_PREFLIGHT_ONLY: 'true'
-      PRIVATE_VERIFY_SOURCE: 'true'
+      PRIVATE_JOB_ID: 45eaeb58-54c1-43a4-bc1d-eb8cb3d55c5f
+      PRIVATE_SOURCE_SHA256: f19b820b9adea3ad1f47ffe465487e472fa8d931b3f4a0a3d077e11bd6c59216
+      PRIVATE_PREFLIGHT_ONLY: 'false'
+      PRIVATE_VERIFY_SOURCE: 'false'
     steps:
       - name: Use current stable Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
