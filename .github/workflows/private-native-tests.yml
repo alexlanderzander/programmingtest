@@ -57,14 +57,13 @@ jobs:
         shell: bash
         run: |
           set -eu
-          extra=()
+          set -- --broker "$PRIVATE_BROKER_URL" \
+            --job "$PRIVATE_JOB_ID" \
+            --source-sha256 "$PRIVATE_SOURCE_SHA256"
           if [ "$PRIVATE_PREFLIGHT_ONLY" = 'true' ]; then
-            extra+=(--verify-access)
+            set -- "$@" --verify-access
             if [ "$PRIVATE_VERIFY_SOURCE" = 'true' ]; then
-              extra+=(--verify-source)
+              set -- "$@" --verify-source
             fi
           fi
-          python3 "$RUNNER_TEMP/private-native-launcher/private-runner.py" \
-            --broker "$PRIVATE_BROKER_URL" \
-            --job "$PRIVATE_JOB_ID" \
-            --source-sha256 "$PRIVATE_SOURCE_SHA256" "${extra[@]}"
+          python3 "$RUNNER_TEMP/private-native-launcher/private-runner.py" "$@"
