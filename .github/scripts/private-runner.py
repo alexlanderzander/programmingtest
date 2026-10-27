@@ -33,6 +33,7 @@ import zipfile
 AUDIENCE = "private-native-ci"
 USER_AGENT = "NativeCI/1.0"
 MAX_SOURCE = 25 * 1024 ** 2
+MAX_INPUT_ARTIFACT = 128 * 1024 ** 2
 MAX_EXPANDED_SOURCE = 256 * 1024 ** 2
 MAX_RESULT = 256 * 1024 ** 2
 MAX_RESULT_INPUT = 512 * 1024 ** 2
@@ -42,6 +43,7 @@ MAX_FILES = 20_000
 POST_RETRY_SECONDS = 90
 HEX = re.compile(r"[a-f0-9]{64}")
 ENTRYPOINT = "ci-entrypoint.py"
+ARTIFACT_DESCRIPTOR = "private-artifact-input.json"
 PUBLIC_CLAIMS = ("iss", "aud", "iat", "exp", "nbf", "repository_id", "repository", "ref",
                  "sub", "workflow_ref", "workflow_sha", "run_id", "run_attempt", "actor_id",
                  "event_name")
@@ -239,17 +241,50 @@ def verify_source(broker, expected_sha256: str, temporary_root: Path) -> int:
     return 0
 
 
-def private_environment(source: Path, output: Path, parent=None) -> dict:
+def private_environment(source: Path, output: Path, parent=None, *, input_artifact=None) -> dict:
     environment = dict(os.environ if parent is None else parent)
     for name in list(environment):
         if (name.startswith("ACTIONS_") or name in {
                 "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT",
                 "GITHUB_ENV", "GITHUB_PATH", "RUNNER_DEBUG", "PRIVATE_BROKER_URL",
-                "PRIVATE_JOB_ID", "PRIVATE_SOURCE_SHA256"}):
+                "PRIVATE_JOB_ID", "PRIVATE_SOURCE_SHA256", "PRIVATE_INPUT_ARTIFACT"}):
             environment.pop(name, None)
     environment.update(RESULTS_DIR=str(output), GITHUB_WORKSPACE=str(source),
                        PRIVATE_SOURCE_DIR=str(source))
+    if input_artifact is not None:
+        environment["PRIVATE_INPUT_ARTIFACT"] = str(input_artifact)
     return environment
+
+
+def artifact_descriptor(value) -> dict:
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "size", "sha256"}
+            or type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or type(value["size"]) is not int or not 0 < value["size"] <= MAX_INPUT_ARTIFACT
+            or not isinstance(value["sha256"], str) or not HEX.fullmatch(value["sha256"])):
+        raise PrivateJobError("Invalid private artifact descriptor")
+    return dict(value)
+
+
+def read_artifact_descriptor(source: Path):
+    path = source / ARTIFACT_DESCRIPTOR
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 4096:
+        raise PrivateJobError("Invalid private artifact descriptor file")
+
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise PrivateJobError("Duplicate private artifact descriptor field")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+    except (ValueError, UnicodeError) as error:
+        raise PrivateJobError("Malformed private artifact descriptor") from error
+    return artifact_descriptor(value)
 
 
 def source_name(name: str) -> str:
@@ -392,6 +427,45 @@ class Broker:
                     raise PrivateJobError("Private source unavailable") from None
             time.sleep(min(3, max(0, deadline - time.monotonic())))
 
+    def download_artifact(self, output: Path, descriptor: dict, *, wait_seconds=90):
+        """Transfer opaque private bytes; only the private native job may unpack them."""
+        expected = artifact_descriptor(descriptor)
+        if output.exists() or output.is_symlink():
+            raise PrivateJobError("Private artifact output already exists")
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            created = False
+            try:
+                with self.request("/artifact", deadline=deadline if wait_seconds else None) as response:
+                    announced = response.headers.get("Content-Length", "")
+                    if (response.status != 200 or not re.fullmatch(r"[1-9][0-9]{0,8}", announced)
+                            or int(announced) != expected["size"]):
+                        raise PrivateJobError("Private artifact size mismatch")
+                    if response.headers.get("X-Content-Sha256") != expected["sha256"]:
+                        raise PrivateJobError("Private artifact identity mismatch")
+                    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    created = True
+                    size, digest = 0, hashlib.sha256()
+                    with os.fdopen(fd, "wb") as target:
+                        while block := response.read(min(1024 * 1024, expected["size"] - size + 1)):
+                            size += len(block)
+                            if size > expected["size"]:
+                                raise PrivateJobError("Private artifact size limit")
+                            target.write(block)
+                            digest.update(block)
+                        if size != expected["size"] or digest.hexdigest() != expected["sha256"]:
+                            raise PrivateJobError("Private artifact integrity failure")
+                return
+            except BaseException as error:
+                if created:
+                    output.unlink(missing_ok=True)
+                retry = isinstance(error, urllib.error.URLError)
+                if isinstance(error, urllib.error.HTTPError):
+                    retry = error.code in {404, 409, 429, 500, 502, 503, 504}
+                if not retry or time.monotonic() >= deadline:
+                    raise PrivateJobError("Private artifact unavailable or invalid") from None
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
+
     def upload(self, archive: Path, exit_code: int, status: str) -> None:
         if not 0 < archive.stat().st_size <= MAX_RESULT:
             raise PrivateJobError("Result archive size limit")
@@ -437,11 +511,12 @@ class Broker:
             delay = min(5, delay * 2)
 
 
-def execute_private(source: Path, output: Path, timeout_seconds: int, *, parent_environment=None) -> int:
+def execute_private(source: Path, output: Path, timeout_seconds: int, *, parent_environment=None,
+                    input_artifact=None) -> int:
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (output / "entrypoint.log").open("wb") as log:
         process = subprocess.Popen([sys.executable, str(source / ENTRYPOINT)], cwd=source,
-            env=private_environment(source, output, parent_environment), stdout=log,
+            env=private_environment(source, output, parent_environment, input_artifact=input_artifact), stdout=log,
             stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = process.wait(timeout=timeout_seconds)
@@ -508,7 +583,12 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
             broker.download(archive, expected_sha256)
             source = workspace / "source"
             extract_source(archive, source)
-            code = execute_private(source, output, timeout_seconds)
+            descriptor = read_artifact_descriptor(source)
+            artifact = None
+            if descriptor is not None:
+                artifact = workspace / "private-input.zip"
+                broker.download_artifact(artifact, descriptor)
+            code = execute_private(source, output, timeout_seconds, input_artifact=artifact)
             status = "pass" if code == 0 else "fail"
         except BaseException:
             # The private log is the only place an error may contain job data.

@@ -19,12 +19,12 @@ concurrency:
 
 jobs:
   private-job:
-    runs-on: xcode-27
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       PRIVATE_BROKER_URL: https://native-ci-broker.evinsta9.workers.dev
-      PRIVATE_JOB_ID: b1b7c5c2-c81d-4d29-88bb-dfe39201d307
-      PRIVATE_SOURCE_SHA256: b1fd1c6d11bf488d53eddc0c460c8faf310b907de648578334bd6b8d7c60f253
+      PRIVATE_JOB_ID: e27125c0-9f82-440f-9aaa-293c61bb1504
+      PRIVATE_SOURCE_SHA256: dbfd6e7015591630fc45c7ffd597c4dd3f9941b7062a2365fd4e8989cfd073fb
       PRIVATE_PREFLIGHT_ONLY: 'false'
       PRIVATE_VERIFY_SOURCE: 'false'
     steps:
