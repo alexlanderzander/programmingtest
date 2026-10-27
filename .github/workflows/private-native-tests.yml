@@ -1,0 +1,61 @@
+name: Private native test launcher
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/private-native-tests.yml
+      - .github/scripts/private-runner.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: private-native-test-launcher
+  cancel-in-progress: false
+
+jobs:
+  private-job:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      PRIVATE_BROKER_URL: https://native-ci-broker.evinsta9.workers.dev
+      PRIVATE_JOB_ID: 2b31d534-31d6-4a81-9e6b-86e907538f90
+      PRIVATE_SOURCE_SHA256: f62ad7fac9431bcc939a55431634b990916f2468765629509302bb57fcd9a948
+    steps:
+      - name: Use current stable Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.12.1'
+          check-latest: true
+          package-manager-cache: false
+      - name: Fetch the public launcher at this exact commit
+        shell: bash
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import urllib.request
+          location = Path(os.environ['RUNNER_TEMP']) / 'private-native-launcher'
+          location.mkdir(mode=0o700)
+          source = ('https://raw.githubusercontent.com/' + os.environ['GITHUB_REPOSITORY']
+                    + '/' + os.environ['GITHUB_SHA'] + '/.github/scripts/private-runner.py')
+          with urllib.request.urlopen(source, timeout=30) as response:
+              data = response.read(256 * 1024 + 1)
+          if not data or len(data) > 256 * 1024:
+              raise SystemExit('Public launcher unavailable')
+          target = location / 'private-runner.py'
+          target.write_bytes(data)
+          target.chmod(0o600)
+          PY
+      - name: Run the authenticated private job
+        shell: bash
+        run: |
+          set -eu
+          python3 "$RUNNER_TEMP/private-native-launcher/private-runner.py" \
+            --broker "$PRIVATE_BROKER_URL" \
+            --job "$PRIVATE_JOB_ID" \
+            --source-sha256 "$PRIVATE_SOURCE_SHA256"
