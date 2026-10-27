@@ -1,0 +1,313 @@
+name: Reuse generic app to measure in-init preview flag
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/simulator-init-preview-flag-reuse.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reuse:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - name: Reuse retained generic app and measure in-init flag only
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import hashlib, io, json, os, pathlib, plistlib, shutil, stat, struct, subprocess, time, urllib.error, urllib.parse, urllib.request, zipfile
+          SOURCE_ARTIFACT=12752772815
+          SOURCE_RUN=40545883491
+          OUTER_SHA='eb7945d708c3174a83088a1b52552ca0ec6b2dd8a9f31b2bb0cfb70fd39d3f3f'
+          APP_SHA='2807f29e559bd2920d1bcf62bf6aae9fcc992fa5780f0741e379ebeb718206f2'
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'generic-init-preview-flag-reuse'
+          root.mkdir(mode=0o700)
+          output=root/'reports'
+          output.mkdir()
+          state={'schema_version':1,'kind':'generic-init-preview-flag-reuse-checkpoint','status':'preparing','stage':'download',
+                 'source_run_id':SOURCE_RUN,'source_artifact_id':SOURCE_ARTIFACT,'rebuild_performed':False}
+          developer=pathlib.Path('/Applications/Xcode_27.1.app/Contents/Developer')
+          sequence=0
+          device=None
+          installed=False
+          native_env={key:value for key,value in os.environ.items() if not key.startswith('ACTIONS_') and key not in ('GITHUB_TOKEN','GH_TOKEN')}
+          native_env['DEVELOPER_DIR']=str(developer)
+
+          def save():
+              (output/'status.json').write_text(json.dumps(state,indent=2,sort_keys=True))
+              print(json.dumps({'stage':state['stage'],'status':state['status']},sort_keys=True),flush=True)
+
+          def run(args,*,timeout=30,check=True,environment=None):
+              global sequence
+              sequence+=1
+              command=list(map(str,args))
+              label=str(sequence).zfill(2)+'-'+pathlib.Path(command[0]).name
+              start=time.monotonic()
+              try:
+                  result=subprocess.run(command,capture_output=True,text=True,timeout=timeout,env=native_env if environment is None else environment)
+              except subprocess.TimeoutExpired as error:
+                  for suffix,value in [('stdout',error.stdout),('stderr',error.stderr)]:
+                      if isinstance(value,bytes):value=value.decode(errors='replace')
+                      (output/(label+'-'+suffix+'.txt')).write_text((value or '')[:512*1024])
+                  (output/(label+'-command.json')).write_text(json.dumps({'command':command,'timeout_seconds':timeout,'elapsed_seconds':round(time.monotonic()-start,3),'outcome':'timeout'},sort_keys=True))
+                  raise
+              for suffix,value in [('stdout',result.stdout),('stderr',result.stderr)]:
+                  (output/(label+'-'+suffix+'.txt')).write_text(value[:512*1024])
+              (output/(label+'-command.json')).write_text(json.dumps({'command':command,'timeout_seconds':timeout,'elapsed_seconds':round(time.monotonic()-start,3),'exit_code':result.returncode},sort_keys=True))
+              if check and result.returncode:raise RuntimeError('generic_command_failed')
+              return result
+
+          def diagnostic(name,args,timeout=12):
+              try:
+                  result=run(args,timeout=timeout,check=False)
+                  return {'name':name,'exit_code':result.returncode}
+              except Exception as error:
+                  return {'name':name,'error_type':type(error).__name__}
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args):return None
+
+          def download_artifact():
+              credential=os.environ.pop('GITHUB_TOKEN','')
+              if not credential:raise RuntimeError('read_scoped_artifact_token_missing')
+              opener=urllib.request.build_opener(NoRedirect())
+              request=urllib.request.Request('https://api.github.com/repos/alexlanderzander/programmingtest/actions/artifacts/'+str(SOURCE_ARTIFACT)+'/zip',headers={'Authorization':'Bearer '+credential,'Accept':'application/vnd.github+json','User-Agent':'GenericCompiledAppReuse/1.0'})
+              try:
+                  response=opener.open(request,timeout=30)
+              except urllib.error.HTTPError as error:
+                  if error.code not in (301,302,303,307,308):raise
+                  location=error.headers.get('Location','')
+                  parsed=urllib.parse.urlsplit(location)
+                  if (parsed.scheme!='https' or parsed.username or parsed.password or not parsed.hostname
+                      or not (parsed.hostname.endswith('.blob.core.windows.net') or parsed.hostname.endswith('.actions.githubusercontent.com'))):
+                      raise RuntimeError('unexpected_artifact_download_origin')
+                  # A cross-origin storage request must never inherit the GitHub token.
+                  credential=None
+                  request=None
+                  response=opener.open(urllib.request.Request(location,headers={'User-Agent':'GenericCompiledAppReuse/1.0'}),timeout=30)
+              credential=None
+              with response:
+                  payload=response.read(4*1024*1024+1)
+              if len(payload)>4*1024*1024 or hashlib.sha256(payload).hexdigest()!=OUTER_SHA:
+                  raise RuntimeError('source_artifact_integrity_mismatch')
+              return payload
+
+          def safe_name(name):
+              value=pathlib.PurePosixPath(name)
+              if not name or chr(92) in name or chr(0) in name or value.is_absolute() or any(x in ('','.','..') for x in name.split('/')):
+                  raise RuntimeError('unsafe_generic_archive_path')
+              return value
+
+          save()
+          try:
+              payload=download_artifact()
+              with zipfile.ZipFile(io.BytesIO(payload)) as outer:
+                  metadata_raw=outer.read('generic-build-metadata.json')
+                  app_bytes=outer.read('generic-compiled-app.zip')
+              if len(metadata_raw)>256*1024 or hashlib.sha256(app_bytes).hexdigest()!=APP_SHA:raise RuntimeError('compiled_app_pin_mismatch')
+              metadata=json.loads(metadata_raw)
+              if (metadata.get('schema_version')!=1 or metadata.get('kind')!='generic-swiftui-compiled-simulator-app'
+                  or metadata.get('archive_sha256')!=APP_SHA or metadata.get('archive_size')!=len(app_bytes)
+                  or metadata.get('codesign_integrity_verified') is not True):raise RuntimeError('compiled_app_metadata_mismatch')
+              (output/'generic-build-metadata.json').write_bytes(metadata_raw)
+              (output/'generic-compiled-app.zip').write_bytes(app_bytes)
+              parent=root/'reused'
+              parent.mkdir(mode=0o700)
+              inventory={item['path']:item for item in metadata['files']}
+              if not inventory or len(inventory)!=len(metadata['files']) or len(inventory)>1000:raise RuntimeError('invalid_compiled_inventory')
+              with zipfile.ZipFile(io.BytesIO(app_bytes)) as app_archive:
+                  entries=app_archive.infolist()
+                  if len(entries)!=len(inventory) or {entry.filename for entry in entries}!=set(inventory):raise RuntimeError('compiled_inventory_mismatch')
+                  expanded=0
+                  for entry in entries:
+                      relative=safe_name(entry.filename)
+                      mode=entry.external_attr>>16
+                      if (entry.is_dir() or stat.S_IFMT(mode) not in (0,stat.S_IFREG) or entry.flag_bits&1
+                          or relative.parts[0]!='GenericActivation.app'):raise RuntimeError('unsupported_compiled_entry')
+                      expanded+=entry.file_size
+                      if expanded>32*1024*1024:raise RuntimeError('compiled_expansion_limit')
+                      data=app_archive.read(entry)
+                      expected=inventory[entry.filename]
+                      if len(data)!=expected['size'] or hashlib.sha256(data).hexdigest()!=expected['sha256']:raise RuntimeError('compiled_file_integrity_mismatch')
+                      target=parent.joinpath(*relative.parts)
+                      target.parent.mkdir(parents=True,exist_ok=True)
+                      target.write_bytes(data)
+                      target.chmod(0o700 if mode&0o111 else 0o600)
+              app=parent/'GenericActivation.app'
+              info=plistlib.loads((app/'Info.plist').read_bytes())
+              if info['CFBundleIdentifier']!='org.example.swiftui-gui-activation' or info.get('UIApplicationSceneManifest')!=metadata['scene_manifest']:raise RuntimeError('compiled_app_identity_mismatch')
+              state.update(stage='verify_reused_app',archive_sha256=APP_SHA,inventory_files_verified=len(inventory))
+              save()
+              run(['codesign','--verify','--deep','--strict',app],timeout=20)
+              state['codesign_integrity_verified']=True
+              if not developer.is_dir():raise RuntimeError('selected_xcode_missing')
+              state['sdk_version']=run(['xcrun','--sdk','iphonesimulator','--show-sdk-version']).stdout.strip()
+              if state['sdk_version']!='27.1':raise RuntimeError('required_sdk_mismatch')
+              runtimes=json.loads(run(['xcrun','simctl','list','runtimes','--json']).stdout)['runtimes']
+              choices=[r for r in runtimes if r.get('isAvailable') and r.get('version')=='27.0']
+              if not choices:raise RuntimeError('required_runtime_missing')
+              runtime=choices[0]
+              device_type='com.apple.CoreSimulator.SimDeviceType.iPhone-13-mini'
+              if runtime.get('supportedDeviceTypes') and not any(t.get('identifier')==device_type for t in runtime['supportedDeviceTypes']):raise RuntimeError('runtime_device_mismatch')
+              state.update(stage='boot',runtime=runtime['identifier'],device_type=device_type,boot_deadline_seconds=540)
+              save()
+              device=run(['xcrun','simctl','create','GenericReusedAppCheckpoint',device_type,runtime['identifier']]).stdout.strip()
+              state['simulator_id']=device
+              boot_start=time.monotonic()
+              run(['xcrun','simctl','boot',device],timeout=30)
+              run(['xcrun','simctl','bootstatus',device,'-b'],timeout=540)
+              state['boot_elapsed_seconds']=round(time.monotonic()-boot_start,3)
+              state['readiness_diagnostics']=[diagnostic('device_state',['xcrun','simctl','list','devices','--json']),
+                  diagnostic('simulator_services',['xcrun','simctl','spawn',device,'launchctl','list'])]
+              selected=developer/'Applications/Simulator.app'
+              candidates=list(dict.fromkeys([selected,pathlib.Path('/Applications/Simulator.app')]+sorted(pathlib.Path('/Applications').glob('Xcode*.app/Contents/Developer/Applications/Simulator.app'))))
+              gui={'available_gui_paths':[str(p) for p in candidates if p.is_dir()],'gui_process_launch_accepted':False,'native_foreground_window_still_required':True}
+              for path in candidates:
+                  if not path.is_dir():continue
+                  try:
+                      opened=run(['open','-a',path,'--args','-CurrentDeviceUDID',device],timeout=20,check=False)
+                      if opened.returncode==0:
+                          gui.update(gui_process_launch_accepted=True,opened_gui_path=str(path));break
+                  except Exception as error:gui['error_type']=type(error).__name__
+              state.update(gui_discovery=gui,stage='install',install_deadline_seconds=180)
+              save()
+              install_start=time.monotonic()
+              try:run(['xcrun','simctl','install',device,app],timeout=180)
+              finally:state['install_elapsed_seconds']=round(time.monotonic()-install_start,3)
+              installed=True
+              state['install_succeeded']=True
+              state['stage']='activation_cases'
+              state['cases']=[]
+              save()
+              conditions=('scene_phase_active','foreground_active_scene','foreground_key_window')
+              def containers():
+                  base=pathlib.Path.home()/'Library/Developer/CoreSimulator/Devices'/device/'data/Containers/Data/Application'
+                  matches=[]
+                  if not base.is_dir():return matches
+                  for candidate in sorted(base.iterdir()):
+                      identity=candidate/'.com.apple.mobile_container_manager.metadata.plist'
+                      if candidate.is_symlink() or not candidate.is_dir() or identity.is_symlink() or not identity.is_file():continue
+                      try:
+                          if identity.stat().st_size>1024*1024:continue
+                          identifier=plistlib.loads(identity.read_bytes()).get('MCMMetadataIdentifier')
+                      except (ValueError,OSError):continue
+                      if identifier==info['CFBundleIdentifier']:matches.append(candidate)
+                  return matches
+
+              def receipt(container,name):
+                  path=container/'Documents'/name
+                  if path.is_symlink() or not path.is_file() or path.stat().st_size>64*1024:return None
+                  try:value=json.loads(path.read_text())
+                  except (ValueError,OSError):return None
+                  return value if isinstance(value,dict) else None
+
+              for preview in (False,True):
+                  case='set-preview-in-init' if preview else 'control-no-preview-flag'
+                  item={'case':case,'status':'starting','requested_set_preview_in_init':preview}
+                  state['cases'].append(item)
+                  item['termination_diagnostic']=diagnostic('case_terminate',['xcrun','simctl','terminate',device,info['CFBundleIdentifier']],timeout=5)
+                  before=containers()
+                  item['prelaunch_filesystem_container_count']=len(before)
+                  if len(before)>1:raise RuntimeError('ambiguous_bundle_metadata_containers')
+                  if len(before)==1:
+                      for name in ('activation.json','checkpoints.json'):
+                          path=before[0]/'Documents'/name
+                          if path.is_symlink():raise RuntimeError('unexpected_generic_receipt_link')
+                          path.unlink(missing_ok=True)
+                  environment=dict(native_env,SIMCTL_CHILD_NATIVE_ACTIVATION_PROBE='1')
+                  environment.pop('SIMCTL_CHILD_XCODE_RUNNING_FOR_PREVIEWS',None)
+                  environment.pop('XCODE_RUNNING_FOR_PREVIEWS',None)
+                  environment.pop('SIMCTL_CHILD_PROBE_SET_PREVIEW_IN_INIT',None)
+                  if preview:environment['SIMCTL_CHILD_PROBE_SET_PREVIEW_IN_INIT']='1'
+                  case_start=time.monotonic()
+                  try:
+                      launch=run(['xcrun','simctl','launch','--terminate-running-process',device,info['CFBundleIdentifier']],timeout=30,check=False,environment=environment)
+                      item['launch_exit']=launch.returncode
+                  except Exception as error:item['launch_error_type']=type(error).__name__
+                  deadline=time.monotonic()+60
+                  observed=None
+                  checkpoints=None
+                  actual_container=None
+                  while time.monotonic()<deadline:
+                      actual=[]
+                      for candidate in containers():
+                          checkpoint=receipt(candidate,'checkpoints.json')
+                          if checkpoint and checkpoint.get('app_init') is True and checkpoint.get('set_preview_in_init_requested') is preview:
+                              actual.append((candidate,checkpoint))
+                      if len(actual)>1:
+                          item['error_code']='ambiguous_actual_app_receipt';break
+                      if len(actual)==1:
+                          actual_container,checkpoints=actual[0]
+                          candidate_report=receipt(actual_container,'activation.json')
+                          if (candidate_report and candidate_report.get('probe_kind')=='generic-swiftui-in-init-preview-flag'
+                              and candidate_report.get('set_preview_in_init_requested') is preview):
+                              observed=candidate_report
+                              if observed.get('status')=='pass':break
+                      time.sleep(0.2)
+                  if actual_container is None and not containers():
+                      # A fallback is allowed only after launch; it is never an install prerequisite.
+                      try:
+                          fallback=run(['xcrun','simctl','get_app_container',device,info['CFBundleIdentifier'],'data'],timeout=120)
+                          fallback_path=pathlib.Path(fallback.stdout.strip())
+                          if fallback_path in containers():
+                              actual_container=fallback_path
+                              checkpoints=receipt(actual_container,'checkpoints.json')
+                              observed=receipt(actual_container,'activation.json')
+                              item['postlaunch_container_fallback_used']=True
+                      except Exception as error:item['postlaunch_container_fallback_error_type']=type(error).__name__
+                  if actual_container is not None:
+                      for name in ('activation.json','checkpoints.json'):
+                          source=actual_container/'Documents'/name
+                          if source.is_file() and not source.is_symlink():shutil.copy2(source,output/(case+'-'+name))
+                  item['case_elapsed_seconds']=round(time.monotonic()-case_start,3)
+                  item['filesystem_actual_receipt_found']=actual_container is not None
+                  item['checkpoints']=checkpoints
+                  item['conditions']={key:observed.get(key) if observed else None for key in conditions}
+                  item['status']='pass' if observed and observed.get('probe_kind')=='generic-swiftui-in-init-preview-flag' and all(observed.get(key) is True for key in conditions) and observed.get('probe_flag_present') is True and observed.get('preview_flag_present') is preview and observed.get('set_preview_in_init_requested') is preview else 'fail'
+                  if (not checkpoints or checkpoints.get('app_init') is not True or checkpoints.get('launch_preview_flag_absent') is not True
+                      or checkpoints.get('set_preview_in_init_requested') is not preview
+                      or checkpoints.get('setenv_return_code')!=(0 if preview else -1)):
+                      item.update(status='fail',error_code='in_init_flag_experiment_precondition_failed')
+                  if item['status']=='pass':
+                      time.sleep(1)
+                      image=output/('generic-init-reused-'+case+'.png')
+                      run(['xcrun','simctl','io',device,'screenshot','--type=png',image],timeout=20)
+                      data=image.read_bytes()
+                      if data[:8]!=b'\x89PNG\r\n\x1a\n':raise RuntimeError('native_screenshot_missing')
+                      item['screenshot']={'file':image.name,'sha256':hashlib.sha256(data).hexdigest(),'dimensions':struct.unpack_from('>2I',data,16),'kind':'generic-native-screenshot-not-app-evidence'}
+                  save()
+              state.update(status='pass' if all(c['status']=='pass' for c in state['cases']) else 'fail',stage='complete')
+          except Exception as error:
+              state.update(status='fail',primary_error={'stage':state['stage'],'type':type(error).__name__})
+              if isinstance(error,RuntimeError):state['primary_error']['code']=str(error)
+              if isinstance(error,urllib.error.HTTPError):state['primary_error']['http_status']=error.code
+              save()
+              if device:
+                  state['failure_diagnostics']=[diagnostic('device_state',['xcrun','simctl','list','devices','--json']),
+                      diagnostic('simulator_host_services',['pgrep','-lf','CoreSimulatorService|launchd_sim|installd']),
+                      diagnostic('recent_install_errors',['log','show','--last','2m','--style','compact','--predicate','process == "installd" OR process == "CoreSimulatorService"'],timeout=15)]
+          finally:
+              os.environ.pop('GITHUB_TOKEN',None)
+              state['cleanup_diagnostics']=[]
+              if device:
+                  if installed:state['cleanup_diagnostics'].append(diagnostic('terminate',['xcrun','simctl','terminate',device,'org.example.swiftui-gui-activation'],timeout=5))
+                  state['cleanup_diagnostics'].append(diagnostic('shutdown',['xcrun','simctl','shutdown',device],timeout=5))
+              save()
+          print(json.dumps(state,sort_keys=True))
+          if state['status']!='pass':raise SystemExit(1)
+          PY
+      - name: Preserve generic reuse measurements and unchanged app
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: generic-init-preview-flag-reuse
+          path: ${{ runner.temp }}/generic-init-preview-flag-reuse/reports
+          if-no-files-found: error
+          retention-days: 3
