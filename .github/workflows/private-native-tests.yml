@@ -13,7 +13,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: private-native-test-launcher
+  # Each run has its own authenticated input and isolated runner resources.
+  group: private-native-job-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -22,8 +23,8 @@ jobs:
     timeout-minutes: 60
     env:
       PRIVATE_BROKER_URL: https://native-ci-broker.evinsta9.workers.dev
-      PRIVATE_JOB_ID: 3b2be954-11fb-474f-8511-fc7f02e8bd6e
-      PRIVATE_SOURCE_SHA256: 01f23b4f2b9f43c46b6b47d6e79fd6d0cc354eca9501c90b87ee479c4b5e63ee
+      PRIVATE_JOB_ID: 44041a3c-d189-482a-b12d-431aff5a77d7
+      PRIVATE_SOURCE_SHA256: 5b0f1194c787aae246fde9708b3d2352aa05d608c103020f404874476abe287b
       PRIVATE_PREFLIGHT_ONLY: 'false'
       PRIVATE_VERIFY_SOURCE: 'false'
     steps:
