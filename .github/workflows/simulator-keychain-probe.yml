@@ -12,7 +12,7 @@ permissions:
 jobs:
   probe:
     runs-on: xcode-27
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Measure simulator Keychain status for generic signing variants
         shell: bash
@@ -151,66 +151,95 @@ jobs:
           reports = {'schema_version':1, 'probe_kind':'generic-keychain-signing-comparison',
               'sdk':sdk_version,'runtime':runtime['identifier'],'device_type':device_type,
               'xcode':run(['xcodebuild','-version']).stdout.strip(),'variants':[]}
+          def save_reports():
+              (output/'comparison.json').write_text(json.dumps(reports,indent=2,sort_keys=True))
+          save_reports()
           try:
               run(['xcrun','simctl','boot',device])
               run(['xcrun','simctl','bootstatus',device,'-b'],timeout=180)
-              for variant in ['linker-default','unsigned','adhoc-no-entitlements','adhoc-with-entitlements']:
+              for variant in ['adhoc-with-entitlements','adhoc-no-entitlements','linker-default','unsigned']:
                   bundle_id = 'org.example.native-keychain-probe.' + variant
                   app = root / (variant + '.app')
-                  app.mkdir()
-                  shutil.copy2(binary,app/'Probe')
-                  group = 'TEST000000.' + bundle_id
-                  info = {'CFBundleIdentifier':bundle_id,'CFBundleExecutable':'Probe',
-                      'CFBundleName':'Generic Keychain Probe','CFBundlePackageType':'APPL',
-                      'CFBundleVersion':'1','CFBundleShortVersionString':'1.0',
-                      'CFBundleSupportedPlatforms':['iPhoneSimulator'],'MinimumOSVersion':'26.0',
-                      'UIDeviceFamily':[1,2],'UILaunchScreen':{},
-                      'UISupportedInterfaceOrientations':['UIInterfaceOrientationPortrait'],
-                      'ProbeVariant':variant,'ProbeAccessGroup':group}
-                  (app/'Info.plist').write_bytes(plistlib.dumps(info))
-                  if variant == 'unsigned':
-                      run(['codesign','--remove-signature',app/'Probe'],check=False)
-                  elif variant.startswith('adhoc-'):
-                      command = ['codesign','--force','--sign','-','--timestamp=none','--identifier',bundle_id]
-                      if variant == 'adhoc-with-entitlements':
-                          entitlements = root / 'entitlements.plist'
-                          entitlements.write_bytes(plistlib.dumps({
-                              'application-identifier':group,
-                              'com.apple.developer.team-identifier':'TEST000000',
-                              'keychain-access-groups':[group], 'get-task-allow':True}))
-                          command += ['--entitlements',entitlements,'--generate-entitlement-der']
-                      run([*command,app])
-                  signing = run(['codesign','--display','--verbose=4',app],check=False)
-                  verify = run(['codesign','--verify','--strict','--verbose=4',app],check=False)
-                  entitlements = run(['codesign','--display','--entitlements','-','--xml',app],check=False)
-                  (output/(variant+'-signing.txt')).write_text(signing.stdout+signing.stderr+verify.stdout+verify.stderr)
-                  (output/(variant+'-entitlements.xml')).write_text(entitlements.stdout)
-                  observed_entitlements = None
-                  if entitlements.stdout.strip():
-                      try: observed_entitlements = plistlib.loads(entitlements.stdout.encode())
-                      except Exception: pass
-                  item = {'variant':variant,'codesign_display_exit':signing.returncode,
-                      'codesign_verify_exit':verify.returncode,'observed_entitlements':observed_entitlements}
-                  install = run(['xcrun','simctl','install',device,app],timeout=30,check=False)
-                  item['install_exit'] = install.returncode
-                  if install.returncode == 0:
-                      launch = run(['xcrun','simctl','launch','--terminate-running-process',device,bundle_id],timeout=30,check=False)
-                      item['launch_exit'] = launch.returncode
-                      if launch.returncode == 0:
-                          container = pathlib.Path(run(['xcrun','simctl','get_app_container',device,bundle_id,'data']).stdout.strip())
-                          result_path = container/'Documents/probe.json'
-                          deadline = time.monotonic()+20
-                          while not result_path.is_file() and time.monotonic()<deadline: time.sleep(.2)
-                          if result_path.is_file():
-                              item['measurement'] = json.loads(result_path.read_text())
-                              shutil.copyfile(result_path,output/(variant+'.json'))
-                          else: item['error'] = 'result_not_written'
-                      else: item['error'] = launch.stderr[-1500:]
-                      run(['xcrun','simctl','terminate',device,bundle_id],check=False)
-                      run(['xcrun','simctl','uninstall',device,bundle_id],check=False)
-                  else: item['error'] = install.stderr[-1500:]
+                  item = {'variant':variant,'stage':'prepare'}
                   reports['variants'].append(item)
-                  (output/'comparison.json').write_text(json.dumps(reports,indent=2,sort_keys=True))
+                  save_reports()
+                  try:
+                      app.mkdir()
+                      shutil.copy2(binary,app/'Probe')
+                      group = 'TEST000000.' + bundle_id
+                      info = {'CFBundleIdentifier':bundle_id,'CFBundleExecutable':'Probe',
+                          'CFBundleName':'Generic Keychain Probe','CFBundlePackageType':'APPL',
+                          'CFBundleVersion':'1','CFBundleShortVersionString':'1.0',
+                          'CFBundleSupportedPlatforms':['iPhoneSimulator'],'MinimumOSVersion':'26.0',
+                          'UIDeviceFamily':[1,2],'UILaunchScreen':{},
+                          'UISupportedInterfaceOrientations':['UIInterfaceOrientationPortrait'],
+                          'ProbeVariant':variant,'ProbeAccessGroup':group}
+                      (app/'Info.plist').write_bytes(plistlib.dumps(info))
+                      item['stage'] = 'sign'
+                      if variant == 'unsigned':
+                          run(['codesign','--remove-signature',app/'Probe'],check=False)
+                      elif variant.startswith('adhoc-'):
+                          command = ['codesign','--force','--sign','-','--timestamp=none','--identifier',bundle_id]
+                          if variant == 'adhoc-with-entitlements':
+                              entitlements = root / 'entitlements.plist'
+                              entitlements.write_bytes(plistlib.dumps({
+                                  'application-identifier':group,
+                                  'com.apple.developer.team-identifier':'TEST000000',
+                                  'keychain-access-groups':[group], 'get-task-allow':True}))
+                              command += ['--entitlements',entitlements,'--generate-entitlement-der']
+                          run([*command,app])
+                      signing = run(['codesign','--display','--verbose=4',app],check=False)
+                      verify = run(['codesign','--verify','--strict','--verbose=4',app],check=False)
+                      entitlements = run(['codesign','--display','--entitlements','-','--xml',app],check=False)
+                      (output/(variant+'-signing.txt')).write_text(signing.stdout+signing.stderr+verify.stdout+verify.stderr)
+                      (output/(variant+'-entitlements.xml')).write_text(entitlements.stdout)
+                      observed_entitlements = None
+                      if entitlements.stdout.strip():
+                          try: observed_entitlements = plistlib.loads(entitlements.stdout.encode())
+                          except Exception: pass
+                      item.update(codesign_display_exit=signing.returncode,codesign_verify_exit=verify.returncode,
+                          observed_entitlements=observed_entitlements,
+                          signature_state='missing' if signing.returncode else 'verified' if verify.returncode==0 else 'invalid_or_unbound')
+                      if variant.startswith('adhoc-') and verify.returncode:
+                          item['error'] = 'expected_ad_hoc_bundle_signature_invalid'
+                          continue
+                      save_reports()
+                      item['stage'] = 'install'
+                      install = run(['xcrun','simctl','install',device,app],timeout=90,check=False)
+                      item['install_exit'] = install.returncode
+                      if install.returncode:
+                          item['error'] = 'installation_failed'
+                          item['diagnostic'] = install.stderr[-1500:]
+                          continue
+                      item['stage'] = 'launch'
+                      launch = run(['xcrun','simctl','launch','--terminate-running-process',device,bundle_id],timeout=90,check=False)
+                      item['launch_exit'] = launch.returncode
+                      if launch.returncode:
+                          item['error'] = 'launch_failed'
+                          item['diagnostic'] = launch.stderr[-1500:]
+                          continue
+                      item['stage'] = 'read_result'
+                      container = pathlib.Path(run(['xcrun','simctl','get_app_container',device,bundle_id,'data']).stdout.strip())
+                      result_path = container/'Documents/probe.json'
+                      deadline = time.monotonic()+20
+                      while not result_path.is_file() and time.monotonic()<deadline: time.sleep(.2)
+                      if result_path.is_file():
+                          item['measurement'] = json.loads(result_path.read_text())
+                          shutil.copyfile(result_path,output/(variant+'.json'))
+                          item['stage'] = 'measured'
+                      else: item['error'] = 'result_not_written'
+                  except subprocess.TimeoutExpired as error:
+                      item['error'] = 'command_timeout'
+                      item['timeout_seconds'] = error.timeout
+                  except Exception as error:
+                      item['error'] = type(error).__name__
+                      item['diagnostic'] = str(error)[-1500:]
+                  finally:
+                      save_reports()
+                      for operation in ['terminate','uninstall']:
+                          try: run(['xcrun','simctl',operation,device,bundle_id],timeout=15,check=False)
+                          except Exception: item['cleanup_incomplete'] = True
+                      save_reports()
               print('GENERIC_KEYCHAIN_PROBE_JSON_BEGIN')
               print(json.dumps(reports,indent=2,sort_keys=True))
               print('GENERIC_KEYCHAIN_PROBE_JSON_END')
