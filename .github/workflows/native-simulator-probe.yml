@@ -1,0 +1,71 @@
+name: Native Simulator Probe
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/native-simulator-probe.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - name: Inspect genuine Apple toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-simulator-probe"
+          export DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer
+          test -d "$DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          swift --version
+          uname -m
+          xcrun simctl list runtimes --json > "$RUNNER_TEMP/native-simulator-probe/runtimes.json"
+          xcrun simctl list devicetypes --json > "$RUNNER_TEMP/native-simulator-probe/device-types.json"
+      - name: Boot the exact small iPhone simulator
+        shell: bash
+        timeout-minutes: 7
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-simulator-probe'
+          device_type = 'com.apple.CoreSimulator.SimDeviceType.iPhone-13-mini'
+          types = json.loads((root / 'device-types.json').read_text())['devicetypes']
+          assert any(item['identifier'] == device_type for item in types), 'Required device type unavailable'
+          runtimes = json.loads((root / 'runtimes.json').read_text())['runtimes']
+          compatible = [item for item in runtimes if item.get('isAvailable')
+                        and '.iOS-' in item['identifier'] and tuple(map(int, item['version'].split('.'))) >= (27, 1)]
+          assert compatible, 'Required iOS runtime unavailable'
+          runtime = max(compatible, key=lambda item: tuple(map(int, item['version'].split('.'))))
+          device = subprocess.check_output(['xcrun', 'simctl', 'create', 'NativeSimulatorProbe',
+                                           device_type, runtime['identifier']], text=True).strip()
+          (root / 'device.txt').write_text(device)
+          subprocess.run(['xcrun', 'simctl', 'boot', device], check=True)
+          subprocess.run(['xcrun', 'simctl', 'bootstatus', device, '-b'], check=True)
+          subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(root / 'springboard.png')], check=True)
+          (root / 'probe.json').write_text(json.dumps({'device_type': device_type,
+              'runtime': runtime, 'device': device, 'capture': 'native-simulator-springboard',
+              'application_ui_tests_executed': 0}, indent=2))
+          PY
+      - name: Save generic simulator evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: generic-native-simulator-probe
+          path: ${{ runner.temp }}/native-simulator-probe
+          retention-days: 1
+          if-no-files-found: error
+      - name: Shut down disposable simulator
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$RUNNER_TEMP/native-simulator-probe/device.txt"; then
+            xcrun simctl shutdown "$(cat "$RUNNER_TEMP/native-simulator-probe/device.txt")" || true
+          fi
