@@ -14,6 +14,12 @@ jobs:
     runs-on: xcode-27
     timeout-minutes: 10
     steps:
+      - name: Use current stable Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.12.1'
+          check-latest: true
+          package-manager-cache: false
       - name: Inspect genuine Apple toolchain
         shell: bash
         run: |
@@ -25,6 +31,7 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphonesimulator --show-sdk-version
           swift --version
+          node --version
           uname -m
           xcrun simctl list runtimes --json > "$RUNNER_TEMP/native-simulator-probe/runtimes.json"
           xcrun simctl list devicetypes --json > "$RUNNER_TEMP/native-simulator-probe/device-types.json"
@@ -57,7 +64,7 @@ jobs:
           PY
       - name: Save generic simulator evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: generic-native-simulator-probe
           path: ${{ runner.temp }}/native-simulator-probe
