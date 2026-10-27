@@ -41,7 +41,8 @@ jobs:
           assert any(item['identifier'] == device_type for item in types), 'Required device type unavailable'
           runtimes = json.loads((root / 'runtimes.json').read_text())['runtimes']
           compatible = [item for item in runtimes if item.get('isAvailable')
-                        and '.iOS-' in item['identifier'] and tuple(map(int, item['version'].split('.'))) >= (27, 1)]
+                        and '.iOS-' in item['identifier'] and tuple(map(int, item['version'].split('.'))) >= (26, 0)
+                        and any(kind['identifier'] == device_type for kind in item.get('supportedDeviceTypes', []))]
           assert compatible, 'Required iOS runtime unavailable'
           runtime = max(compatible, key=lambda item: tuple(map(int, item['version'].split('.'))))
           device = subprocess.check_output(['xcrun', 'simctl', 'create', 'NativeSimulatorProbe',
