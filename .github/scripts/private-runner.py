@@ -8,8 +8,10 @@ output is copied to the public job console, summaries, artifacts or cache.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -40,6 +42,19 @@ MAX_FILES = 20_000
 POST_RETRY_SECONDS = 90
 HEX = re.compile(r"[a-f0-9]{64}")
 ENTRYPOINT = "ci-entrypoint.py"
+PUBLIC_CLAIMS = ("iss", "aud", "iat", "exp", "nbf", "repository_id", "repository", "ref",
+                 "sub", "workflow_ref", "workflow_sha", "run_id", "run_attempt", "actor_id",
+                 "event_name")
+PUBLIC_JOSE_FIELDS = ("alg", "typ", "kid")
+PUBLIC_WORKER_ERRORS = {
+    "invalid_json", "body_too_large", "invalid_token", "unauthorized", "identity_unavailable",
+    "unknown_signing_key", "run_not_allowed", "job_pending", "not_found",
+    "invalid_job_configuration", "job_expired", "source_pending", "source_part_length_mismatch",
+    "source_part_integrity_mismatch", "invalid_part", "missing_body", "job_already_completed",
+    "part_already_stored", "part_length_mismatch", "part_upload_failed", "part_digest_mismatch",
+    "invalid_manifest", "parts_not_ready", "already_completed", "results_pending",
+    "method_not_allowed", "job_expiring", "request_failed", "internal_error",
+}
 
 
 class PrivateJobError(Exception):
@@ -58,6 +73,138 @@ def remaining_timeout(deadline, maximum):
     if remaining <= 0:
         raise PrivateJobError("Private transfer deadline")
     return min(maximum, remaining)
+
+
+def public_diagnostic_value(value):
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value[:512]
+    if isinstance(value, (int, float)) and math.isfinite(value) and abs(value) < 10 ** 16:
+        return value
+    if isinstance(value, list) and len(value) <= 8 and all(isinstance(item, str) for item in value):
+        return [item[:512] for item in value]
+    return "unsupported-value"
+
+
+def public_token_fields(token: str, segment: int, fields: tuple[str, ...]) -> dict:
+    parts = token.split(".")
+    if len(parts) != 3 or len(parts[segment]) > 48 * 1024 or not re.fullmatch(r"[A-Za-z0-9_-]+", parts[segment]):
+        raise PrivateJobError("Invalid diagnostic identity")
+    payload = base64.urlsafe_b64decode(parts[segment] + "=" * (-len(parts[segment]) % 4))
+    if len(payload) > 32 * 1024:
+        raise PrivateJobError("Diagnostic identity limit")
+    values = json.loads(payload)
+    if not isinstance(values, dict):
+        raise PrivateJobError("Invalid diagnostic identity")
+    return {name: {"type": type(values[name]).__name__, "value": public_diagnostic_value(values[name])}
+            if name in values else {"type": "missing", "value": None} for name in fields}
+
+
+def public_claims(token: str) -> dict:
+    """Decode only diagnostic identity fields, never token/header/signature.
+
+    This is not signature verification; the broker remains the auth verifier.
+    JSON encoding prevents workflow-command or newline injection into logs.
+    """
+    return public_token_fields(token, 1, PUBLIC_CLAIMS)
+
+
+def diagnostic_failure(stage: str, error: BaseException) -> dict:
+    if isinstance(error, urllib.error.HTTPError):
+        kind = "HTTPError"
+    elif isinstance(error, urllib.error.URLError):
+        kind = "URLError"
+    elif isinstance(error, TimeoutError):
+        kind = "TimeoutError"
+    elif isinstance(error, (ValueError, json.JSONDecodeError, PrivateJobError)):
+        kind = "InvalidContext"
+    else:
+        kind = "UnexpectedError"
+    result = {"stage": stage, "type": kind}
+    if isinstance(error, urllib.error.HTTPError) and 100 <= error.code <= 599:
+        result["http_status"] = error.code
+    return result
+
+
+def public_token_endpoint(broker):
+    try:
+        endpoint = getattr(broker, "environment", {}).get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+        parsed = urllib.parse.urlsplit(endpoint)
+        host = parsed.hostname or ""
+        if parsed.scheme in {"https", "http"} and re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host):
+            return {"scheme": parsed.scheme, "host": host}
+    except BaseException:
+        pass
+    return None
+
+
+def token_failure(broker, error):
+    value = diagnostic_failure("oidc-token", error)
+    endpoint = public_token_endpoint(broker)
+    if endpoint is not None:
+        value["endpoint"] = endpoint
+    print(json.dumps(value, sort_keys=True))
+
+
+def public_worker_error(error):
+    code = "unavailable"
+    reported = (error.headers or {}).get("X-Private-CI-Error")
+    if reported in PUBLIC_WORKER_ERRORS:
+        return reported
+    try:
+        payload = error.read(2048)
+        value = json.loads(payload).get("error")
+        if value in PUBLIC_WORKER_ERRORS:
+            code = value
+    except BaseException:
+        pass
+    return code
+
+
+def verify_access(broker, *, wait_seconds=180) -> int:
+    """Public-safe auth preflight. Never fetch, execute or upload source."""
+    try:
+        deadline = time.monotonic() + wait_seconds
+        token = broker.token(deadline=deadline if wait_seconds else None)
+    except BaseException as error:
+        token_failure(broker, error)
+        return 1
+    try:
+        claims = public_claims(token)
+        jose = public_token_fields(token, 0, PUBLIC_JOSE_FIELDS)
+    except BaseException as error:
+        print(json.dumps(diagnostic_failure("oidc-claims", error), sort_keys=True))
+        return 1
+    print(json.dumps({"stage": "oidc-claims", "claims": claims, "jose_header": jose}, sort_keys=True, ensure_ascii=True))
+    while True:
+        request = urllib.request.Request(broker.base + "/source", method="HEAD",
+            headers={"Authorization": "Bearer " + token, "User-Agent": USER_AGENT})
+        try:
+            with broker.opener.open(request, timeout=remaining_timeout(deadline, 30) if wait_seconds else 30) as response:
+                status = response.status
+                # Never consume source bytes, including on a bad upstream.
+            print(json.dumps({"stage": "source-head", "http_status": status}, sort_keys=True))
+            return 0 if status == 200 else 1
+        except urllib.error.HTTPError as error:
+            result = diagnostic_failure("source-head", error)
+            result["worker_error"] = public_worker_error(error)
+            remaining = deadline - time.monotonic()
+            if error.code not in {403, 409, 503} or remaining <= 0:
+                print(json.dumps(result, sort_keys=True))
+                return 1
+        except BaseException as error:
+            print(json.dumps(diagnostic_failure("source-head", error), sort_keys=True))
+            return 1
+        time.sleep(min(3, remaining))
+        if time.monotonic() >= deadline:
+            print(json.dumps(result, sort_keys=True))
+            return 1
+        try:
+            token = broker.token(deadline=deadline)
+        except BaseException as error:
+            token_failure(broker, error)
+            return 1
 
 
 def private_environment(source: Path, output: Path, parent=None) -> dict:
@@ -348,6 +495,8 @@ def main(argv=None) -> int:
     parser.add_argument("--job", required=True)
     parser.add_argument("--source-sha256", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=3000)
+    parser.add_argument("--verify-access", action="store_true",
+                        help="Print allowlisted public OIDC identity fields and HEAD status; no private job execution.")
     args = parser.parse_args(argv)
     try:
         def cancelled(_number, _frame):
@@ -357,9 +506,17 @@ def main(argv=None) -> int:
         # source pinning, packing and authenticated private-result transfer.
         if not 1 <= args.timeout_seconds <= 3000:
             raise PrivateJobError("Invalid job timeout")
+        transfer = Broker(args.broker, args.job)
+        if args.verify_access:
+            return verify_access(transfer)
         temporary = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
-        code = run(Broker(args.broker, args.job), args.source_sha256, args.timeout_seconds, temporary)
+        code = run(transfer, args.source_sha256, args.timeout_seconds, temporary)
     except BaseException:
+        if args.verify_access:
+            # Arguments contain only public launcher configuration, but avoid
+            # rendering exception messages or URLs even for invalid context.
+            print(json.dumps({"stage": "preflight-context", "type": "InvalidContext"}))
+            return 1
         print("Private job could not complete. Inspect its private result channel.")
         return 1
     print("Private job " + ("passed" if code == 0 else "failed") + ". Reference: " + args.job)
