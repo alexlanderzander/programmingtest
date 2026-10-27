@@ -12,7 +12,7 @@ permissions:
 jobs:
   probe:
     runs-on: xcode-27
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Measure simulator Keychain status for generic signing variants
         shell: bash
@@ -30,7 +30,22 @@ jobs:
           os.environ['DEVELOPER_DIR'] = str(developer)
 
           def run(args, *, timeout=60, check=True):
-              result = subprocess.run(list(map(str, args)), capture_output=True, text=True, timeout=timeout)
+              command = list(map(str, args))
+              try:
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+              except subprocess.TimeoutExpired as error:
+                  if command[:3] == ['xcrun','simctl','bootstatus']:
+                      for label, value in [('stdout',error.stdout),('stderr',error.stderr)]:
+                          if isinstance(value,bytes): value = value.decode(errors='replace')
+                          (output/('boot-timeout-'+label+'.txt')).write_text(value or '')
+                      try:
+                          state = subprocess.run(['xcrun','simctl','list','devices','--json'],
+                              capture_output=True,text=True,timeout=30)
+                          (output/'boot-timeout-simulator-state.json').write_text(state.stdout)
+                          (output/'boot-timeout-state-stderr.txt').write_text(state.stderr)
+                      except Exception:
+                          (output/'boot-timeout-state-stderr.txt').write_text('Simulator state query did not complete')
+                  raise
               if check and result.returncode:
                   raise RuntimeError('Generic probe command failed: ' + ' '.join(map(str,args)) + '\n' + result.stderr[-3000:])
               return result
@@ -156,7 +171,7 @@ jobs:
           save_reports()
           try:
               run(['xcrun','simctl','boot',device])
-              run(['xcrun','simctl','bootstatus',device,'-b'],timeout=180)
+              run(['xcrun','simctl','bootstatus',device,'-b'],timeout=600)
               for variant in ['adhoc-with-entitlements','adhoc-no-entitlements','linker-default','unsigned']:
                   bundle_id = 'org.example.native-keychain-probe.' + variant
                   app = root / (variant + '.app')
