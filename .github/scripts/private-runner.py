@@ -207,6 +207,38 @@ def verify_access(broker, *, wait_seconds=180) -> int:
             return 1
 
 
+def verify_source(broker, expected_sha256: str, temporary_root: Path) -> int:
+    """Read authenticated source privately to verify the transfer, never unpack it."""
+    count = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix="private-source-verification-", dir=temporary_root) as name:
+            directory = Path(name)
+            directory.chmod(0o700)
+            path = directory / "source.zip"
+            path.touch(mode=0o600, exist_ok=False)
+            try:
+                broker.download(path, expected_sha256)
+                count = path.stat().st_size
+            except BaseException:
+                count = path.stat().st_size if path.is_file() else 0
+                raise
+    except BaseException as error:
+        # Only a fixed diagnostic enum is public. Never render exception text,
+        # filenames, archive contents, response bodies, headers or token values.
+        known = {"Invalid source size": "invalid_source_size",
+                 "Source identity mismatch": "source_identity_mismatch",
+                 "Source integrity failure": "source_integrity_mismatch",
+                 "Source size limit": "source_size_limit",
+                 "Private source unavailable": "source_unavailable"}
+        code = known.get(str(error), "source_verification_failed") if isinstance(error, PrivateJobError) else "source_verification_failed"
+        print(json.dumps({"stage": "source-integrity", "source_hash_matches": False,
+                          "byte_count": count, "error": code}, sort_keys=True))
+        return 1
+    print(json.dumps({"stage": "source-integrity", "source_hash_matches": True,
+                      "byte_count": count}, sort_keys=True))
+    return 0
+
+
 def private_environment(source: Path, output: Path, parent=None) -> dict:
     environment = dict(os.environ if parent is None else parent)
     for name in list(environment):
@@ -497,6 +529,8 @@ def main(argv=None) -> int:
     parser.add_argument("--timeout-seconds", type=int, default=3000)
     parser.add_argument("--verify-access", action="store_true",
                         help="Print allowlisted public OIDC identity fields and HEAD status; no private job execution.")
+    parser.add_argument("--verify-source", action="store_true",
+                        help="After successful access preflight, privately verify source bytes without unpacking or executing.")
     args = parser.parse_args(argv)
     try:
         def cancelled(_number, _frame):
@@ -506,9 +540,16 @@ def main(argv=None) -> int:
         # source pinning, packing and authenticated private-result transfer.
         if not 1 <= args.timeout_seconds <= 3000:
             raise PrivateJobError("Invalid job timeout")
+        if args.verify_source and not args.verify_access:
+            print(json.dumps({"stage": "preflight-context", "type": "InvalidContext"}))
+            return 1
         transfer = Broker(args.broker, args.job)
         if args.verify_access:
-            return verify_access(transfer)
+            code = verify_access(transfer)
+            if code or not args.verify_source:
+                return code
+            temporary = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+            return verify_source(transfer, args.source_sha256, temporary)
         temporary = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
         code = run(transfer, args.source_sha256, args.timeout_seconds, temporary)
     except BaseException:

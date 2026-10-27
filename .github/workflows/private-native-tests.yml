@@ -25,6 +25,7 @@ jobs:
       PRIVATE_JOB_ID: 2b31d534-31d6-4a81-9e6b-86e907538f90
       PRIVATE_SOURCE_SHA256: f62ad7fac9431bcc939a55431634b990916f2468765629509302bb57fcd9a948
       PRIVATE_PREFLIGHT_ONLY: 'true'
+      PRIVATE_VERIFY_SOURCE: 'true'
     steps:
       - name: Use current stable Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -59,6 +60,9 @@ jobs:
           extra=()
           if [ "$PRIVATE_PREFLIGHT_ONLY" = 'true' ]; then
             extra+=(--verify-access)
+            if [ "$PRIVATE_VERIFY_SOURCE" = 'true' ]; then
+              extra+=(--verify-source)
+            fi
           fi
           python3 "$RUNNER_TEMP/private-native-launcher/private-runner.py" \
             --broker "$PRIVATE_BROKER_URL" \
