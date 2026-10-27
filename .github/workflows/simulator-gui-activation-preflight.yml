@@ -21,7 +21,7 @@ jobs:
           python3 - <<'PY'
           SWIFT_SOURCE = 'import SwiftUI\nimport UIKit\n\n@MainActor\nenum ProbeEvidence {\n    static var checkpoints: [String: Any] = [:]\n    static func mark(_ key: String, values: [String: Any] = [:]) {\n        checkpoints[key] = true\n        checkpoints.merge(values) { _, new in new }\n        checkpoints["preview_flag_present"] = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"\n        checkpoints["probe_flag_present"] = ProcessInfo.processInfo.environment["NATIVE_ACTIVATION_PROBE"] == "1"\n        guard let data = try? JSONSerialization.data(withJSONObject: checkpoints, options: [.sortedKeys, .prettyPrinted]) else { return }\n        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]\n        try? data.write(to: documents.appendingPathComponent("checkpoints.json"), options: .atomic)\n    }\n}\n\n@main\n@MainActor\nstruct GenericActivationApp: App {\n    init() { ProbeEvidence.mark("app_init") }\n    var body: some Scene {\n        WindowGroup { ActivationView() }\n    }\n}\n\n@MainActor\nstruct ActivationView: View {\n    @Environment(\\.scenePhase) private var scenePhase\n    @State private var ready = false\n\n    var body: some View {\n        VStack(spacing: 20) {\n            Image(systemName: ready ? "checkmark.circle.fill" : "hourglass")\n                .font(.system(size: 64))\n                .foregroundStyle(ready ? Color.green : Color.secondary)\n            Text("SwiftUI activation probe").font(.title2.bold())\n            Text(ready ? "Scene active · foreground key window" : "Waiting for activation")\n                .multilineTextAlignment(.center)\n            Text("Generic lifecycle check").foregroundStyle(.secondary)\n        }\n        .padding(24)\n        .frame(maxWidth: .infinity, maxHeight: .infinity)\n        .background(Color(.systemBackground))\n        .onAppear { ProbeEvidence.mark("on_appear") }\n        .task(id: scenePhase) { @MainActor in\n            ProbeEvidence.mark("task_started", values: ["task_scene_phase": String(describing: scenePhase)])\n            guard ProcessInfo.processInfo.environment["NATIVE_ACTIVATION_PROBE"] == "1" else { return }\n            let phaseActive = scenePhase == .active\n            for attempt in 0..<150 {\n                if Task.isCancelled { return }\n                let activeScenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }\n                    .filter { $0.activationState == .foregroundActive }\n                let foreground = !activeScenes.isEmpty\n                let keyWindow = activeScenes.contains { $0.windows.contains(where: \\.isKeyWindow) }\n                let passed = phaseActive && foreground && keyWindow\n                ready = passed\n                ProbeEvidence.mark("activation_sampled", values: ["scene_phase_active": phaseActive,\n                    "foreground_active_scene": foreground, "foreground_key_window": keyWindow])\n                let report: [String: Any] = [\n                    "schema_version": 1,\n                    "probe_kind": "generic-swiftui-gui-activation",\n                    "status": passed ? "pass" : "waiting",\n                    "scene_phase_active": phaseActive,\n                    "foreground_active_scene": foreground,\n                    "foreground_key_window": keyWindow,\n                    "probe_flag_present": true,\n                    "preview_flag_present": ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1",\n                    "poll_attempt": attempt,\n                    "os_version": UIDevice.current.systemVersion\n                ]\n                do {\n                    let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys, .prettyPrinted])\n                    let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]\n                    try data.write(to: documents.appendingPathComponent("activation.json"), options: .atomic)\n                } catch { print("Generic activation report write failed") }\n                if passed { return }\n                do { try await Task.sleep(for: .milliseconds(200)) }\n                catch { return }\n            }\n        }\n    }\n}\n'
           PBX_SOURCE = '// !$*UTF8*$!\n{\n archiveVersion = 1;\n classes = {};\n objectVersion = 56;\n objects = {\n  A00000000000000000000001 = {isa = PBXProject; attributes = {LastUpgradeCheck = 2700;}; buildConfigurationList = A00000000000000000000002; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A00000000000000000000003; productRefGroup = A00000000000000000000004; projectDirPath = ""; projectRoot = ""; targets = (A00000000000000000000005);};\n  A00000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000006); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug;};\n  A00000000000000000000003 = {isa = PBXGroup; children = (A00000000000000000000007, A00000000000000000000004); sourceTree = "<group>";};\n  A00000000000000000000004 = {isa = PBXGroup; children = (A00000000000000000000008); name = Products; sourceTree = "<group>";};\n  A00000000000000000000005 = {isa = PBXNativeTarget; buildConfigurationList = A00000000000000000000009; buildPhases = (A0000000000000000000000A); buildRules = (); dependencies = (); name = GenericActivation; productName = GenericActivation; productReference = A00000000000000000000008; productType = "com.apple.product-type.application";};\n  A00000000000000000000006 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 26.0; SWIFT_VERSION = 6.0;}; name = Debug;};\n  A00000000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>";};\n  A00000000000000000000008 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GenericActivation.app; sourceTree = BUILT_PRODUCTS_DIR;};\n  A00000000000000000000009 = {isa = XCConfigurationList; buildConfigurations = (A0000000000000000000000B); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug;};\n  A0000000000000000000000A = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000000C); runOnlyForDeploymentPostprocessing = 0;};\n  A0000000000000000000000B = {isa = XCBuildConfiguration; buildSettings = {PRODUCT_BUNDLE_IDENTIFIER = "org.example.swiftui-gui-activation"; PRODUCT_NAME = "$(TARGET_NAME)"; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; TARGETED_DEVICE_FAMILY = "1,2"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 1.0; CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; AD_HOC_CODE_SIGNING_ALLOWED = YES;}; name = Debug;};\n  A0000000000000000000000C = {isa = PBXBuildFile; fileRef = A00000000000000000000007;};\n };\n rootObject = A00000000000000000000001;\n}\n'
-          import hashlib, json, os, pathlib, plistlib, shutil, struct, subprocess, time
+          import hashlib, json, os, pathlib, plistlib, shutil, struct, subprocess, time, zipfile
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'generic-swiftui-activation'
           root.mkdir(mode=0o700)
           output = root / 'reports'
@@ -33,6 +33,7 @@ jobs:
 
           def save():
               (output/'status.json').write_text(json.dumps(state,indent=2,sort_keys=True))
+              print(json.dumps({'stage':state['stage'],'status':state['status']},sort_keys=True),flush=True)
 
           def run(args, *, timeout=60, check=True, environment=None):
               global sequence
@@ -87,7 +88,31 @@ jobs:
               info=plistlib.loads((app/'Info.plist').read_bytes())
               if not isinstance(info.get('UIApplicationSceneManifest'),dict): raise RuntimeError('generated_scene_manifest_missing')
               state['generated_scene_manifest']=info['UIApplicationSceneManifest']
+              generic_archive=output/'generic-compiled-app.zip'
+              compiled_files=[]
+              with zipfile.ZipFile(generic_archive,'x',compression=zipfile.ZIP_DEFLATED,compresslevel=4) as zipped:
+                  for path in sorted(app.rglob('*')):
+                      if path.is_symlink(): raise RuntimeError('unexpected_generic_bundle_link')
+                      if path.is_dir(): continue
+                      if not path.is_file(): raise RuntimeError('unexpected_generic_bundle_file')
+                      relative=path.relative_to(app.parent).as_posix()
+                      content=path.read_bytes()
+                      compiled_files.append({'path':relative,'size':len(content),'sha256':hashlib.sha256(content).hexdigest()})
+                      zipped.write(path,relative)
+              compiled={'schema_version':1,'kind':'generic-swiftui-compiled-simulator-app',
+                  'xcode':state['xcode'],'sdk_version':state['sdk_version'],'runtime':state['runtime'],
+                  'device_type':device_type,'architecture':'arm64','configuration':'Debug',
+                  'source_sha256':hashlib.sha256(SWIFT_SOURCE.encode()).hexdigest(),
+                  'bundle_id':info['CFBundleIdentifier'],'scene_manifest':info['UIApplicationSceneManifest'],
+                  'archive':generic_archive.name,'archive_size':generic_archive.stat().st_size,
+                  'archive_sha256':hashlib.sha256(generic_archive.read_bytes()).hexdigest(),
+                  'files':compiled_files,'codesign_integrity_verified':False}
+              (output/'generic-build-metadata.json').write_text(json.dumps(compiled,indent=2,sort_keys=True))
+              state.update(stage='compiled_app_retained',compiled_app={key:compiled[key] for key in ('archive','archive_size','archive_sha256')})
+              save()
               run(['codesign','--verify','--deep','--strict',app],timeout=20)
+              compiled['codesign_integrity_verified']=True
+              (output/'generic-build-metadata.json').write_text(json.dumps(compiled,indent=2,sort_keys=True))
               state['stage']='boot'
               save()
               device=run(['xcrun','simctl','create','GenericSwiftUIActivation',device_type,runtime['identifier']]).stdout.strip()
@@ -96,10 +121,28 @@ jobs:
               run(['xcrun','simctl','bootstatus',device,'-b'],timeout=600)
               state['stage']='open_gui'
               save()
-              run(['open','-a',developer/'Applications/Simulator.app','--args','-CurrentDeviceUDID',device],timeout=30)
-              gui=run(['pgrep','-f',str(developer/'Applications/Simulator.app/Contents/MacOS/Simulator')],timeout=10,check=False)
-              state['simulator_gui_process_present']=gui.returncode==0
-              if not state['simulator_gui_process_present']: raise RuntimeError('simulator_gui_not_running')
+              selected=developer/'Applications/Simulator.app'
+              candidates=list(dict.fromkeys([selected,pathlib.Path('/Applications/Simulator.app')]+
+                  sorted(pathlib.Path('/Applications').glob('Xcode*.app/Contents/Developer/Applications/Simulator.app'))))
+              gui={'schema_version':1,'selected_xcode_gui_exists':selected.is_dir(),
+                  'available_gui_paths':[str(path) for path in candidates if path.is_dir()],
+                  'gui_process_launch_accepted':False,'native_foreground_window_still_required':True}
+              for path in candidates:
+                  if not path.is_dir(): continue
+                  try:
+                      opened=run(['open','-a',path,'--args','-CurrentDeviceUDID',device],timeout=30,check=False)
+                      gui['open_exit_code']=opened.returncode
+                      if opened.returncode==0:
+                          gui.update(gui_process_launch_accepted=True,opened_gui_path=str(path))
+                          process=run(['pgrep','-f',str(path/'Contents/MacOS/Simulator')],timeout=10,check=False)
+                          gui['gui_process_observed']=process.returncode==0
+                          break
+                  except (OSError,subprocess.TimeoutExpired) as error:
+                      gui['open_error_kind']=type(error).__name__
+              if not gui['gui_process_launch_accepted']:
+                  gui['fallback']='Continue real headless simctl launch; require an actual foreground key window.'
+              state['gui_discovery']=gui
+              (output/'gui-discovery.json').write_text(json.dumps(gui,indent=2,sort_keys=True))
               state['stage']='install_launch'
               save()
               run(['xcrun','simctl','install',device,app],timeout=60)
