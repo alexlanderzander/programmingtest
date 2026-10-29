@@ -6,6 +6,8 @@ final class TabReproTests: XCTestCase {
     func testBaseline() throws { try exercise("baseline") }
     func testLabelIdentity() throws { try exercise("label-id") }
     func testNativeItemTraits() throws { try exercise("native-traits") }
+    func testVariedSymbols() throws { try exercise("varied-symbols") }
+    func testSplitColumns() throws { try exercise("split-columns") }
 
     private func exercise(_ mode: String) throws {
         continueAfterFailure = true

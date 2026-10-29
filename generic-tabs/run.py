@@ -36,6 +36,8 @@ try:
     result = run(["xcodebuild", "test-without-building", "-xctestrun", runs[0], "-destination", "id=" + sim,
         "-parallel-testing-enabled", "NO", "-test-timeouts-enabled", "YES",
         "-default-test-execution-time-allowance", "180", "-maximum-test-execution-time-allowance", "210",
+        "-only-testing:GenericNativeTabsTests/TabReproTests/testVariedSymbols",
+        "-only-testing:GenericNativeTabsTests/TabReproTests/testSplitColumns",
         "-resultBundlePath", output / "native.xcresult"], "test.log", 480, check=False)
     exit_code = result.returncode
 except Exception as error:

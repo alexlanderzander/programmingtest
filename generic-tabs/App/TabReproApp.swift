@@ -14,8 +14,29 @@ struct TabRepro: View {
     let mode: String
     @State private var selected = 0
     @State private var windowStart = 0
+    @State private var columns: NavigationSplitViewVisibility = .detailOnly
+    @State private var compactColumn: NavigationSplitViewColumn = .detail
 
     private var visible: [Int] { [0] + Array((windowStart + 1)...(windowStart + 4)) }
+    private func symbol(_ index: Int) -> String {
+        let symbols = ["star", "heart", "pencil", "paperclip", "bell", "bolt", "moon", "sun.max",
+                       "folder", "book", "leaf", "globe", "link", "tray"]
+        return mode == "varied-symbols" ? symbols[index] : "circle"
+    }
+
+    @ViewBuilder private func page(_ index: Int) -> some View {
+        if mode == "split-columns" {
+            NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+                List { Text("Generic sidebar") }
+            } detail: {
+                NavigationStack { ReproPage(index: index) }
+            }
+            .navigationSplitViewStyle(.balanced)
+            .toolbar(removing: .sidebarToggle)
+        } else {
+            ReproPage(index: index)
+        }
+    }
 
     var body: some View {
         VStack {
@@ -43,14 +64,14 @@ struct TabRepro: View {
             TabView(selection: $selected) {
                 ForEach(0..<14) { index in
                     if mode == "label-id" {
-                        Tab(value: index) { ReproPage(index: index) } label: {
-                            Label("Item \(index + 1)", systemImage: "circle")
+                        Tab(value: index) { page(index) } label: {
+                            Label("Item \(index + 1)", systemImage: symbol(index))
                                 .id(windowStart)
                         }
                         .hidden(!visible.contains(index))
                     } else {
-                        Tab("Item \(index + 1)", systemImage: "circle", value: index) {
-                            ReproPage(index: index)
+                        Tab("Item \(index + 1)", systemImage: symbol(index), value: index) {
+                            page(index)
                         }
                         .hidden(!visible.contains(index))
                     }
@@ -127,6 +148,10 @@ struct NativeControllerProbe: UIViewRepresentable {
                     "bar_hidden": bar.isHidden,
                     "bar_frame": String(describing: bar.frame),
                     "mode": mode,
+                    "screen_native_bounds_pixels": String(describing: window?.windowScene?.screen.nativeBounds ?? .zero),
+                    "screen_native_scale": window?.windowScene?.screen.nativeScale ?? 0,
+                    "screen_render_scale": window?.windowScene?.screen.scale ?? 0,
+                    "actual_interface_orientation": window?.windowScene?.effectiveGeometry.interfaceOrientation.rawValue ?? 0,
                 ])
             }
             if let data = try? JSONSerialization.data(withJSONObject: observations, options: [.sortedKeys]),
