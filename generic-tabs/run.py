@@ -1,4 +1,4 @@
-import json, os, pathlib, shutil, subprocess, sys, uuid
+import json, os, pathlib, shutil, subprocess, sys, uuid, signal, threading, time
 
 root = pathlib.Path(__file__).resolve().parent
 output = root / "results"
@@ -13,6 +13,8 @@ def run(argv, name, timeout, check=True):
     return result
 
 sim = None
+recorder = None
+recording_timer = None
 exit_code = 1
 try:
     data = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "-j"], env=env))
@@ -33,17 +35,29 @@ try:
     run(["xcrun", "simctl", "bootstatus", sim, "-b"], "bootstatus.log", 180)
     runs = list((root / "DerivedData/Build/Products").glob("*.xctestrun"))
     if len(runs) != 1: raise ValueError("Expected one generated xctestrun")
+    # Bounded recording is evidence of real native gesture/HUD behavior only.
+    recording_log = (output / "recording.log").open("wb")
+    recorder = subprocess.Popen(["xcrun", "simctl", "io", sim, "recordVideo", "--codec=h264", "--force",
+        str(output / "actual-hold.mov")], env=env, stdout=recording_log, stderr=subprocess.STDOUT)
+    def stop_recording():
+        if recorder and recorder.poll() is None: recorder.send_signal(signal.SIGINT)
+    recording_timer = threading.Timer(90, stop_recording)
+    recording_timer.start()
     result = run(["xcodebuild", "test-without-building", "-xctestrun", runs[0], "-destination", "id=" + sim,
         "-parallel-testing-enabled", "NO", "-test-timeouts-enabled", "YES",
         "-default-test-execution-time-allowance", "180", "-maximum-test-execution-time-allowance", "210",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testVisitedGating",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testBindingGuard",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldOnly",
-        "-resultBundlePath", output / "native.xcresult"], "test.log", 480, check=False)
+        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldDisableTrace",
+        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldKeepEnabledTrace",
+        "-resultBundlePath", output / "native.xcresult"], "test.log", 360, check=False)
     exit_code = result.returncode
 except Exception as error:
     (output / "error.json").write_text(json.dumps({"kind": type(error).__name__, "message": str(error)}, indent=2))
 finally:
+    if recording_timer: recording_timer.cancel()
+    if recorder:
+        if recorder.poll() is None: recorder.send_signal(signal.SIGINT)
+        try: recorder.wait(timeout=10)
+        except subprocess.TimeoutExpired: recorder.kill()
     result = output / "native.xcresult"
     if result.is_dir():
         for name, argv in (("summary.json", ["get", "test-results", "summary", "--path", result]),

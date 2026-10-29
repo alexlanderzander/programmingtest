@@ -12,6 +12,53 @@ final class TabReproTests: XCTestCase {
     func testBindingGuard() throws { try exercise("binding-guard") }
     func testHoldOnly() throws { try exercise("hold-only") }
 
+    func testHoldDisableTrace() throws { try traceHold("hold-disable") }
+    func testHoldKeepEnabledTrace() throws { try traceHold("hold-keep-enabled") }
+
+    private func traceHold(_ mode: String) throws {
+        continueAfterFailure = true
+        let app = XCUIApplication()
+        app.launchEnvironment["REPRO_MODE"] = mode
+        app.launch()
+        XCTAssertTrue(app.staticTexts["page.0"].waitForExistence(timeout: 30))
+        let identity = app.staticTexts["state.0"].label
+        app.textFields["draft.0"].tap()
+        app.textFields["draft.0"].typeText("Generic unsent draft")
+        app.buttons["hide-keyboard"].tap()
+        for (step, target) in [4, 5, 6, 0].enumerated() {
+            let bar = try XCTUnwrap(app.tabBars.allElementsBoundByAccessibilityElement.first(where: { $0.isHittable }))
+            let y = (bar.frame.midY - app.frame.minY) / app.frame.height
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: y))
+                .press(forDuration: 0.7, thenDragTo: app.coordinate(withNormalizedOffset:
+                    CGVector(dx: (CGFloat(target) + 0.5) / 14, dy: y)),
+                    withVelocity: .slow, thenHoldForDuration: 0.4)
+            let didReach = app.staticTexts["page.\(target)"].waitForExistence(timeout: 3)
+            let actualButtons = bar.buttons.allElementsBoundByAccessibilityElement.map {
+                ["label": $0.label, "selected": String($0.isSelected), "hittable": String($0.isHittable)]
+            }
+            let trace = app.descendants(matching: .any).matching(identifier: "hold-trace").firstMatch
+            let probe = app.descendants(matching: .any).matching(identifier: "native-controller-probe").firstMatch
+            let observation: [String: Any] = ["mode": mode, "step": step, "requested_item": target + 1,
+                "did_reach_requested_page": didReach, "actual_buttons": actualButtons,
+                "actual_selection_label": app.staticTexts["selection"].label,
+                "actual_hold_events": trace.value as? String ?? "<unavailable>",
+                "native_controller_observations": probe.value as? String ?? "<unavailable>",
+                "actual_hud_exists_after_release": app.staticTexts["actual-held-target"].exists]
+            let data = try JSONSerialization.data(withJSONObject: observation, options: [.prettyPrinted, .sortedKeys])
+            let record = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+            record.name = "\(mode)-\(step)-actual-hold-trace"; record.lifetime = .keepAlways; add(record)
+            let image = XCTAttachment(screenshot: app.screenshot())
+            image.name = "\(mode)-\(step)-actual-screen"; image.lifetime = .keepAlways; add(image)
+            XCTAssertTrue(didReach)
+            let selected = actualButtons.filter { $0["selected"] == "true" && $0["hittable"] == "true" }
+            XCTAssertEqual(selected.count, 1)
+            XCTAssertEqual(selected.first?["label"], "Item \(target + 1)")
+            XCTAssertFalse(app.staticTexts["actual-held-target"].exists)
+        }
+        XCTAssertEqual(app.staticTexts["state.0"].label, identity)
+        XCTAssertEqual(app.textFields["draft.0"].value as? String, "Generic unsent draft")
+    }
+
     private func exercise(_ mode: String) throws {
         continueAfterFailure = true
         let app = XCUIApplication()

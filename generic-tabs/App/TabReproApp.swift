@@ -19,6 +19,7 @@ struct TabRepro: View {
     @State private var visited: Set<Int> = [0]
     @State private var pendingSelection: Int?
     @State private var pendingTask: Task<Void, Never>?
+    @State private var heldIndex: Int?
 
     private var visible: [Int] { [0] + Array((windowStart + 1)...(windowStart + 4)) }
     private var selection: Binding<Int> {
@@ -110,8 +111,16 @@ struct TabRepro: View {
             NativeControllerProbe(mode: mode, generation: selected)
                 .frame(width: 1, height: 1)
         }
+        .overlay(alignment: .top) {
+            if let heldIndex {
+                Text("Holding Item \(heldIndex + 1)")
+                    .padding().background(.regularMaterial, in: Capsule())
+                    .accessibilityIdentifier("actual-held-target")
+            }
+        }
         .background {
-            GenericNativeHold(enabled: mode == "hold-only", commit: move)
+            GenericNativeHold(enabled: mode.hasPrefix("hold-"), disableBar: mode != "hold-keep-enabled",
+                              heldChanged: { heldIndex = $0 }, commit: move)
                 .frame(width: 1, height: 1)
         }
     }
@@ -119,15 +128,24 @@ struct TabRepro: View {
 
 struct GenericNativeHold: UIViewRepresentable {
     let enabled: Bool
+    let disableBar: Bool
+    let heldChanged: (Int?) -> Void
     let commit: (Int) -> Void
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIView(context: Context) -> HoldView {
         let view = HoldView()
         view.owner = context.coordinator
+        view.isUserInteractionEnabled = false
+        view.isAccessibilityElement = true
+        view.accessibilityIdentifier = "hold-trace"
+        view.accessibilityLabel = "Actual native hold events"
+        context.coordinator.traceView = view
         return view
     }
     func updateUIView(_ view: HoldView, context: Context) {
         context.coordinator.enabled = enabled
+        context.coordinator.disableBar = disableBar
+        context.coordinator.heldChanged = heldChanged
         context.coordinator.commit = commit
         context.coordinator.attach(to: view.window)
     }
@@ -140,6 +158,10 @@ struct GenericNativeHold: UIViewRepresentable {
 
     @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var enabled = false
+        var disableBar = true
+        var heldChanged: (Int?) -> Void = { _ in }
+        weak var traceView: HoldView?
+        private var events: [[String: Any]] = []
         var commit: (Int) -> Void = { _ in }
         private weak var window: UIWindow?
         private weak var heldBar: UITabBar?
@@ -147,6 +169,18 @@ struct GenericNativeHold: UIViewRepresentable {
         private var recognizer: UILongPressGestureRecognizer?
         private var lastIndex = 0
         private var holding = false
+
+        private func log(_ phase: String, recognizer: UIGestureRecognizer? = nil) {
+            let point = recognizer?.location(in: window) ?? .zero
+            events.append(["phase": phase, "uptime": ProcessInfo.processInfo.systemUptime,
+                "recognizer_state": recognizer?.state.rawValue ?? -1,
+                "x": point.x, "y": point.y, "last_index": lastIndex, "holding": holding,
+                "bar_interaction_enabled": heldBar?.isUserInteractionEnabled as Any? ?? NSNull(),
+                "actual_bar_selected_title": heldBar?.selectedItem?.title ?? "<nil>"])
+            if events.count > 180 { events.removeFirst(events.count - 180) }
+            if let data = try? JSONSerialization.data(withJSONObject: events, options: [.sortedKeys]),
+               let value = String(data: data, encoding: .utf8) { traceView?.accessibilityValue = value }
+        }
 
         func attach(to target: UIWindow?) {
             if window === target && (recognizer != nil || !enabled) { return }
@@ -179,26 +213,38 @@ struct GenericNativeHold: UIViewRepresentable {
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
             guard enabled, let window else { return false }
             heldBar = bar(at: recognizer.location(in: window), in: window)
+            log("should-begin", recognizer: recognizer)
             return heldBar != nil
         }
         func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
         @objc private func hold(_ recognizer: UILongPressGestureRecognizer) {
             guard let window, window.bounds.width > 0 else { return }
             func index() -> Int { min(13, max(0, Int(recognizer.location(in: window).x / window.bounds.width * 14))) }
+            log("callback-enter", recognizer: recognizer)
             switch recognizer.state {
             case .began:
                 holding = true
                 priorInteraction = heldBar?.isUserInteractionEnabled ?? true
-                heldBar?.isUserInteractionEnabled = false
+                log("before-disable", recognizer: recognizer)
+                if disableBar { heldBar?.isUserInteractionEnabled = false }
+                log("after-disable", recognizer: recognizer)
                 lastIndex = index()
+                heldChanged(lastIndex)
+                log("began-finished", recognizer: recognizer)
             case .changed:
-                if holding { lastIndex = index() }
+                if holding { lastIndex = index(); heldChanged(lastIndex) }
+                log("changed-finished", recognizer: recognizer)
             case .ended, .cancelled, .failed:
-                guard holding else { return }
+                guard holding else { log("end-without-holding", recognizer: recognizer); return }
                 holding = false
+                log("before-restore", recognizer: recognizer)
                 heldBar?.isUserInteractionEnabled = priorInteraction
-                heldBar = nil
+                log("after-restore", recognizer: recognizer)
+                heldChanged(nil)
+                log("before-commit", recognizer: recognizer)
                 commit(lastIndex)
+                log("after-commit", recognizer: recognizer)
+                heldBar = nil
             default: break
             }
         }
