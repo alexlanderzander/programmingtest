@@ -1,0 +1,36 @@
+name: Generic native hidden-tab reproduction
+on:
+  push:
+    branches: [main]
+    paths: ['generic-tabs/**', '.github/workflows/generic-native-tabs.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: generic-native-tabs-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  reproduce:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - name: Fetch only generic reproduction files at this commit
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,urllib.request
+          base='https://raw.githubusercontent.com/'+os.environ['GITHUB_REPOSITORY']+'/'+os.environ['GITHUB_SHA']+'/'
+          for name in ['generic-tabs/App/TabReproApp.swift','generic-tabs/Tests/TabReproTests.swift','generic-tabs/project.yml','generic-tabs/run.py']:
+              target=pathlib.Path(name);target.parent.mkdir(parents=True,exist_ok=True)
+              with urllib.request.urlopen(base+name,timeout=30) as response: target.write_bytes(response.read())
+          PY
+      - name: Build and exercise generic native tabs
+        run: python3 generic-tabs/run.py
+      - name: Preserve generic results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: generic-native-tabs
+          path: generic-tabs/results
+          include-hidden-files: true
+          retention-days: 30
