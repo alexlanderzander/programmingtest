@@ -125,7 +125,7 @@ struct NativeControllerProbe: UIViewRepresentable {
                     "item_traits_before": before,
                     "item_traits_after": items.map { $0.accessibilityTraits.rawValue },
                     "bar_hidden": bar.isHidden,
-                    "bar_frame": NSStringFromCGRect(bar.frame),
+                    "bar_frame": String(describing: bar.frame),
                     "mode": mode,
                 ])
             }

@@ -28,7 +28,7 @@ final class TabReproTests: XCTestCase {
             let snapshots = bars.map { bar in
                 bar.buttons.allElementsBoundByAccessibilityElement.map { button in
                     ["label": button.label, "selected": String(button.isSelected),
-                     "hittable": String(button.isHittable), "frame": NSStringFromCGRect(button.frame)]
+                     "hittable": String(button.isHittable), "frame": String(describing: button.frame)]
                 }
             }
             let selected = snapshots.flatMap { $0 }.filter { $0["selected"] == "true" && $0["hittable"] == "true" }
