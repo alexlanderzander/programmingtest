@@ -1,0 +1,37 @@
+name: GenericNativeTabs
+options:
+  deploymentTarget:
+    iOS: '26.0'
+settings:
+  base:
+    SWIFT_VERSION: '6.0'
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    GENERATE_INFOPLIST_FILE: YES
+targets:
+  GenericNativeTabs:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: org.example.generic-native-tabs
+      INFOPLIST_KEY_UILaunchScreen_Generation: YES
+      INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+      TARGETED_DEVICE_FAMILY: '1,2'
+  GenericNativeTabsTests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: GenericNativeTabs
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: org.example.generic-native-tabs.tests
+      TEST_TARGET_NAME: GenericNativeTabs
+schemes:
+  GenericNativeTabs:
+    build:
+      targets:
+        GenericNativeTabs: all
+        GenericNativeTabsTests: [test]
+    test:
+      targets: [GenericNativeTabsTests]
