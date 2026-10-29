@@ -8,6 +8,9 @@ final class TabReproTests: XCTestCase {
     func testNativeItemTraits() throws { try exercise("native-traits") }
     func testVariedSymbols() throws { try exercise("varied-symbols") }
     func testSplitColumns() throws { try exercise("split-columns") }
+    func testVisitedGating() throws { try exercise("visited-gating") }
+    func testBindingGuard() throws { try exercise("binding-guard") }
+    func testHoldOnly() throws { try exercise("hold-only") }
 
     private func exercise(_ mode: String) throws {
         continueAfterFailure = true
@@ -56,7 +59,16 @@ final class TabReproTests: XCTestCase {
             XCTAssertEqual(bars.count, 1)
             XCTAssertEqual(selected.count, 1, "\(mode) step\(step): native AX must have exactly one selected item")
             XCTAssertEqual(selected.first?["label"], "Item \(index + 1)")
-            if step < 14 { app.buttons["next"].tap() }
+            if step < 14 {
+                if mode == "hold-only", let bar = bars.first {
+                    let y = (bar.frame.midY - app.frame.minY) / app.frame.height
+                    let destination = (step + 1) % 14
+                    app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: y))
+                        .press(forDuration: 0.7, thenDragTo: app.coordinate(withNormalizedOffset:
+                            CGVector(dx: (CGFloat(destination) + 0.5) / 14, dy: y)),
+                            withVelocity: .slow, thenHoldForDuration: 0.4)
+                } else { app.buttons["next"].tap() }
+            }
         }
         XCTAssertEqual(app.staticTexts["state.0"].label, firstIdentity)
         XCTAssertEqual(app.textFields["draft.0"].value as? String, "Generic unsent draft")
