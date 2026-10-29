@@ -35,20 +35,11 @@ try:
     run(["xcrun", "simctl", "bootstatus", sim, "-b"], "bootstatus.log", 180)
     runs = list((root / "DerivedData/Build/Products").glob("*.xctestrun"))
     if len(runs) != 1: raise ValueError("Expected one generated xctestrun")
-    # Bounded recording is evidence of real native gesture/HUD behavior only.
-    recording_log = (output / "recording.log").open("wb")
-    recorder = subprocess.Popen(["xcrun", "simctl", "io", sim, "recordVideo", "--codec=h264", "--force",
-        str(output / "actual-hold.mov")], env=env, stdout=recording_log, stderr=subprocess.STDOUT)
-    def stop_recording():
-        if recorder and recorder.poll() is None: recorder.send_signal(signal.SIGINT)
-    recording_timer = threading.Timer(90, stop_recording)
-    recording_timer.start()
     result = run(["xcodebuild", "test-without-building", "-xctestrun", runs[0], "-destination", "id=" + sim,
         "-parallel-testing-enabled", "NO", "-test-timeouts-enabled", "YES",
         "-default-test-execution-time-allowance", "180", "-maximum-test-execution-time-allowance", "210",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldDisableTrace",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldKeepEnabledTrace",
-        "-resultBundlePath", output / "native.xcresult"], "test.log", 360, check=False)
+        "-only-testing:GenericNativeTabsTests/TabReproTests/testVisitedGating",
+        "-resultBundlePath", output / "native.xcresult"], "test.log", 240, check=False)
     exit_code = result.returncode
 except Exception as error:
     (output / "error.json").write_text(json.dumps({"kind": type(error).__name__, "message": str(error)}, indent=2))
