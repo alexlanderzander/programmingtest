@@ -12,6 +12,7 @@ final class TabReproTests: XCTestCase {
     func testBindingGuard() throws { try exercise("binding-guard") }
     func testHoldOnly() throws { try exercise("hold-only") }
 
+    func testHoldGuardTrace() throws { try traceHold("hold-guard") }
     func testHoldDisableTrace() throws { try traceHold("hold-disable") }
     func testHoldKeepEnabledTrace() throws { try traceHold("hold-keep-enabled") }
 

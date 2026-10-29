@@ -38,7 +38,7 @@ try:
     result = run(["xcodebuild", "test-without-building", "-xctestrun", runs[0], "-destination", "id=" + sim,
         "-parallel-testing-enabled", "NO", "-test-timeouts-enabled", "YES",
         "-default-test-execution-time-allowance", "180", "-maximum-test-execution-time-allowance", "210",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testVisitedGating",
+        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldGuardTrace",
         "-resultBundlePath", output / "native.xcresult"], "test.log", 240, check=False)
     exit_code = result.returncode
 except Exception as error:
@@ -55,6 +55,22 @@ finally:
                            ("attachments-export.log", ["export", "attachments", "--path", result, "--output-path", output / "attachments"])):
             try: run(["xcrun", "xcresulttool", *argv], name, 20, check=False)
             except Exception as error: (output / (name + ".error")).write_text(type(error).__name__)
+    # Keep finalized native summary and original requested PNG/JSON attachments.
+    # Full raw bundles and automatic videos are intentionally omitted from this
+    # small generic experiment artifact; their SHA-256 manifest stays explicit.
+    import hashlib
+    omitted = []
+    for path in sorted(output.rglob("*")):
+        if path.is_file() and ("native.xcresult" in path.parts or path.suffix in {".mp4", ".mov"}):
+            omitted.append({"path": str(path.relative_to(output)), "bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    (output / "artifact-policy.json").write_text(json.dumps({
+        "kind": "finalized-summary-and-original-exported-attachments",
+        "raw_xcresult_retained": False, "automatic_videos_retained": False,
+        "omitted_members": omitted}, indent=2))
+    if result.is_dir(): shutil.rmtree(result)
+    for path in output.rglob("*"):
+        if path.is_file() and path.suffix in {".mp4", ".mov"}: path.unlink()
     if sim:
         for command in ("shutdown", "delete"):
             try: subprocess.run(["xcrun", "simctl", command, sim], env=env, capture_output=True, timeout=5)

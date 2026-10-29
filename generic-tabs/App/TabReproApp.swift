@@ -23,7 +23,7 @@ struct TabRepro: View {
 
     private var visible: [Int] { [0] + Array((windowStart + 1)...(windowStart + 4)) }
     private var selection: Binding<Int> {
-        if mode == "binding-guard" {
+        if mode == "binding-guard" || mode == "hold-guard" {
             Binding(get: { selected }, set: { value in
                 guard pendingSelection == nil || pendingSelection == value else { return }
                 move(to: value)
@@ -42,7 +42,7 @@ struct TabRepro: View {
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             windowStart = start
-            if mode == "binding-guard" {
+            if mode == "binding-guard" || mode == "hold-guard" {
                 pendingSelection = next
                 pendingTask?.cancel()
                 // This mode reproduces a suspected callback guard, not a
