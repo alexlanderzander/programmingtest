@@ -44,6 +44,13 @@ POST_RETRY_SECONDS = 90
 HEX = re.compile(r"[a-f0-9]{64}")
 ENTRYPOINT = "ci-entrypoint.py"
 ARTIFACT_DESCRIPTOR = "private-artifact-input.json"
+ARTIFACT_TRANSPORT = "private-artifact-transport.json"
+ARTIFACT_IDENTITY = "private-artifact-identity.json"
+MAX_TRANSPORT_DESCRIPTOR = 64 * 1024
+MAX_ARTIFACT_IDENTITY = 8 * 1024 ** 2
+MAX_EXPANDED_ARTIFACT = 320 * 1024 ** 2
+MAX_ARTIFACT_FILES = 12_000
+RETAINED_MEMBER = "native/native-audit-app.zip"
 PUBLIC_CLAIMS = ("iss", "aud", "iat", "exp", "nbf", "repository_id", "repository", "ref",
                  "sub", "workflow_ref", "workflow_sha", "run_id", "run_attempt", "actor_id",
                  "event_name")
@@ -287,6 +294,210 @@ def read_artifact_descriptor(source: Path):
     return artifact_descriptor(value)
 
 
+def _unique_private_json(raw):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise PrivateJobError("Duplicate private transport field")
+            value[key] = item
+        return value
+
+    def constant(_value):
+        raise PrivateJobError("Nonfinite private transport field")
+
+    try:
+        return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    except (ValueError, UnicodeError) as error:
+        raise PrivateJobError("Malformed private transport metadata") from error
+
+
+def _sized_hash(value, maximum):
+    return (isinstance(value, dict) and type(value.get("size")) is int
+            and 0 < value["size"] <= maximum and isinstance(value.get("sha256"), str)
+            and HEX.fullmatch(value["sha256"]) is not None)
+
+
+def retained_artifact_transport(value):
+    """Validate a frozen, explicit retained-result envelope without a URL."""
+    if (not isinstance(value, dict) or set(value) != {
+            "schema_version", "backend", "producer_job_id", "outer", "nested", "identity"}
+            or type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or value["backend"] != "r2-retained-result" or not isinstance(value["producer_job_id"], str)):
+        raise PrivateJobError("Invalid retained artifact transport")
+    try:
+        if str(uuid.UUID(value["producer_job_id"])) != value["producer_job_id"]:
+            raise ValueError()
+    except ValueError:
+        raise PrivateJobError("Invalid retained artifact producer") from None
+    outer, nested, identity = value["outer"], value["nested"], value["identity"]
+    if (not _sized_hash(outer, MAX_RESULT) or set(outer) != {"size", "sha256", "parts"}
+            or not _sized_hash(nested, MAX_INPUT_ARTIFACT) or set(nested) != {"member", "size", "sha256"}
+            or nested["member"] != RETAINED_MEMBER or not _sized_hash(identity, MAX_ARTIFACT_IDENTITY)
+            or set(identity) != {"size", "sha256"} or not isinstance(outer["parts"], list)
+            or not 1 <= len(outer["parts"]) <= MAX_PARTS):
+        raise PrivateJobError("Invalid retained artifact bounds or member")
+    total = 0
+    for index, part in enumerate(outer["parts"]):
+        if (not _sized_hash(part, 4 * 1024 ** 2)
+                or set(part) != {"index", "size", "sha256", "object_key"}
+                or type(part["index"]) is not int or part["index"] != index
+                or part["object_key"] != f'native-ci-results/v1/jobs/{value["producer_job_id"]}/result/{index}/{part["sha256"]}'):
+            raise PrivateJobError("Invalid retained artifact part")
+        total += part["size"]
+    if total != outer["size"]:
+        raise PrivateJobError("Retained artifact part lengths differ")
+    return value
+
+
+def _bounded_source_file(source, name, maximum):
+    path = source / name
+    if (path.is_symlink() or not path.is_file() or path.resolve().parent != source.resolve()
+            or not stat.S_ISREG(path.stat().st_mode) or not 0 < path.stat().st_size <= maximum):
+        raise PrivateJobError("Missing or unbounded pinned transport metadata")
+    return path
+
+
+def read_artifact_transport(source: Path):
+    path = source / ARTIFACT_TRANSPORT
+    if not path.exists() and not path.is_symlink():
+        return None
+    path = _bounded_source_file(source, ARTIFACT_TRANSPORT, MAX_TRANSPORT_DESCRIPTOR)
+    value = retained_artifact_transport(_unique_private_json(path.read_bytes()))
+    inner = read_artifact_descriptor(source)
+    if inner != {"schema_version": 1, "size": value["nested"]["size"], "sha256": value["nested"]["sha256"]}:
+        raise PrivateJobError("Pinned inner descriptor differs from retained transport")
+    identity = _bounded_source_file(source, ARTIFACT_IDENTITY, MAX_ARTIFACT_IDENTITY)
+    raw = identity.read_bytes()
+    if len(raw) != value["identity"]["size"] or hashlib.sha256(raw).hexdigest() != value["identity"]["sha256"]:
+        raise PrivateJobError("Pinned original identity differs from retained transport")
+    _artifact_inventory(_unique_private_json(raw), value)
+    return value
+
+
+def _artifact_relative(name):
+    if (not isinstance(name, str) or not name or "\\" in name or ":" in name
+            or any(ord(char) < 32 for char in name)):
+        raise PrivateJobError("Unsafe private artifact member")
+    path = PurePosixPath(name)
+    if (path.is_absolute() or str(path) != name or any(part in {".", ".."} for part in path.parts)
+            or any(part in {".git", ".build", "DerivedData", "SourcePackages"} for part in path.parts)
+            or any(part.endswith((".app", ".appex")) for part in path.parts)
+            or path.suffix.lower() in {".p8", ".p12", ".pfx", ".pem", ".key", ".mobileprovision",
+                                       ".swift", ".m", ".mm", ".c", ".cc", ".cpp", ".h", ".hpp", ".xcconfig"}
+            or path.name in {"DevSecrets.swift", ".env"}):
+        raise PrivateJobError("Unsupported private artifact member")
+    return path
+
+
+def _artifact_inventory(identity, transport):
+    if (not isinstance(identity, dict) or type(identity.get("schema_version")) is not int
+            or identity["schema_version"] != 1 or identity.get("private") is not True
+            or identity.get("app_directory") != "app" or identity.get("archive_sha256") != transport["nested"]["sha256"]
+            or type(identity.get("archive_bytes")) is not int or identity["archive_bytes"] != transport["nested"]["size"]
+            or not isinstance(identity.get("files"), dict) or not 1 <= len(identity["files"]) <= MAX_ARTIFACT_FILES):
+        raise PrivateJobError("Pinned private artifact identity differs")
+    total, folded = 0, set()
+    for name, record in identity["files"].items():
+        _artifact_relative(name)
+        normal = unicodedata.normalize("NFC", name).casefold()
+        if (normal in folded or not isinstance(record, dict) or set(record) != {"bytes", "sha256", "mode"}
+                or type(record["bytes"]) is not int or record["bytes"] < 0
+                or type(record["mode"]) is not int or record["mode"] not in {0o644, 0o755}
+                or not isinstance(record["sha256"], str) or not HEX.fullmatch(record["sha256"])):
+            raise PrivateJobError("Invalid private artifact inventory")
+        folded.add(normal)
+        total += record["bytes"]
+    if total > MAX_EXPANDED_ARTIFACT:
+        raise PrivateJobError("Private artifact inventory expansion limit")
+    if any('/'.join(name.split('/')[:index]) in folded
+           for name in folded for index in range(1, len(name.split('/')))):
+        raise PrivateJobError("Private artifact file/directory collision")
+    return identity["files"]
+
+
+def extract_retained_artifact(outer_path, output, transport, identity_path):
+    """Extract one pinned opaque ZIP, verify every app member, never expand app."""
+    transport = retained_artifact_transport(transport)
+    if output.exists() or output.is_symlink() or output.parent.is_symlink():
+        raise PrivateJobError("Private artifact output already exists")
+    for path, maximum in ((outer_path, MAX_RESULT), (identity_path, MAX_ARTIFACT_IDENTITY)):
+        if (path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat().st_mode)
+                or not 0 < path.stat().st_size <= maximum):
+            raise PrivateJobError("Retained artifact input is not a bounded regular file")
+    outer_digest = hashlib.sha256()
+    with outer_path.open("rb") as stream:
+        for data in iter(lambda: stream.read(1024 * 1024), b""):
+            outer_digest.update(data)
+    if outer_path.stat().st_size != transport["outer"]["size"] or outer_digest.hexdigest() != transport["outer"]["sha256"]:
+        raise PrivateJobError("Retained outer archive integrity differs")
+    raw_identity = identity_path.read_bytes()
+    if len(raw_identity) != transport["identity"]["size"] or hashlib.sha256(raw_identity).hexdigest() != transport["identity"]["sha256"]:
+        raise PrivateJobError("Pinned original identity integrity differs")
+    inventory = _artifact_inventory(_unique_private_json(raw_identity), transport)
+    created = False
+    try:
+        with zipfile.ZipFile(outer_path) as outer:
+            entries, seen = outer.infolist(), {}
+            if not 1 <= len(entries) <= MAX_FILES or sum(item.file_size for item in entries) > MAX_RESULT_INPUT:
+                raise PrivateJobError("Retained outer archive expansion limit")
+            for entry in entries:
+                if ":" in entry.filename or any(ord(char) < 32 for char in entry.filename):
+                    raise PrivateJobError("Unsafe retained outer archive path")
+                name = source_name(entry.filename)
+                normal = unicodedata.normalize("NFC", name).casefold()
+                kind = stat.S_IFMT(entry.external_attr >> 16)
+                if (normal in seen or entry.is_dir() or entry.flag_bits & 1
+                        or kind not in {0, stat.S_IFREG} or entry.file_size < 0):
+                    raise PrivateJobError("Unsafe retained outer archive member")
+                seen[normal] = entry
+            if any('/'.join(name.split('/')[:index]) in seen
+                   for name in seen for index in range(1, len(name.split('/')))):
+                raise PrivateJobError("Retained outer file/directory collision")
+            member = outer.getinfo(RETAINED_MEMBER)
+            if member.file_size != transport["nested"]["size"] or outer.testzip() is not None:
+                raise PrivateJobError("Retained outer CRC or nested length differs")
+            fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+            digest, size = hashlib.sha256(), 0
+            with os.fdopen(fd, "wb") as target, outer.open(member) as source:
+                for data in iter(lambda: source.read(1024 * 1024), b""):
+                    size += len(data)
+                    if size > transport["nested"]["size"]:
+                        raise PrivateJobError("Nested private artifact size limit")
+                    target.write(data)
+                    digest.update(data)
+            if size != transport["nested"]["size"] or digest.hexdigest() != transport["nested"]["sha256"]:
+                raise PrivateJobError("Nested private artifact integrity differs")
+        with zipfile.ZipFile(output) as inner:
+            entries = inner.infolist()
+            if (len(entries) != len(inventory) or len({item.filename for item in entries}) != len(entries)
+                    or {item.filename for item in entries} != {"app/" + name for name in inventory}):
+                raise PrivateJobError("Private artifact member inventory differs")
+            for entry in entries:
+                relative = entry.filename[4:]
+                _artifact_relative(relative)
+                record, mode = inventory[relative], entry.external_attr >> 16
+                if (entry.is_dir() or entry.flag_bits & 1 or stat.S_IFMT(mode) not in {0, stat.S_IFREG}
+                        or (mode & 0o777) != record["mode"] or entry.file_size != record["bytes"]):
+                    raise PrivateJobError("Private artifact member type or mode differs")
+                digest, size = hashlib.sha256(), 0
+                with inner.open(entry) as source:
+                    for data in iter(lambda: source.read(1024 * 1024), b""):
+                        size += len(data)
+                        if size > record["bytes"]:
+                            raise PrivateJobError("Private artifact member exceeds pinned bytes")
+                        digest.update(data)
+                if size != record["bytes"] or digest.hexdigest() != record["sha256"]:
+                    raise PrivateJobError("Private artifact member integrity differs")
+    except BaseException as error:
+        if created:
+            output.unlink(missing_ok=True)
+        if isinstance(error, (PrivateJobError, KeyboardInterrupt, SystemExit)):
+            raise
+        raise PrivateJobError("Retained private artifact archive is invalid") from error
+
+
 def source_name(name: str) -> str:
     if not isinstance(name, str) or not name or "\\" in name or "\x00" in name:
         raise PrivateJobError("Invalid source path")
@@ -466,6 +677,50 @@ class Broker:
                     raise PrivateJobError("Private artifact unavailable or invalid") from None
             time.sleep(min(3, max(0, deadline - time.monotonic())))
 
+    def download_retained_artifact(self, output: Path, descriptor: dict, *, wait_seconds=90):
+        """Fetch only this consumer's authorized, pinned retained outer ZIP."""
+        expected = retained_artifact_transport(descriptor)["outer"]
+        if output.exists() or output.is_symlink():
+            raise PrivateJobError("Private retained input already exists")
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            created = False
+            try:
+                with self.request("/artifact", deadline=deadline if wait_seconds else None) as response:
+                    announced = response.headers.get("Content-Length", "")
+                    if (response.status != 200 or not re.fullmatch(r"[1-9][0-9]{0,8}", announced)
+                            or int(announced) != expected["size"]
+                            or response.headers.get("X-Content-Sha256") != expected["sha256"]):
+                        raise PrivateJobError("Retained artifact response identity differs")
+                    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    created = True
+                    whole = hashlib.sha256()
+                    with os.fdopen(fd, "wb") as target:
+                        for part in expected["parts"]:
+                            remaining, digest = part["size"], hashlib.sha256()
+                            while remaining:
+                                data = response.read(min(65536, remaining))
+                                if not data or len(data) > remaining:
+                                    raise PrivateJobError("Retained artifact part length differs")
+                                remaining -= len(data)
+                                target.write(data)
+                                digest.update(data)
+                                whole.update(data)
+                            if digest.hexdigest() != part["sha256"]:
+                                raise PrivateJobError("Retained artifact part integrity differs")
+                        if response.read(1) or whole.hexdigest() != expected["sha256"]:
+                            raise PrivateJobError("Retained artifact archive integrity differs")
+                return
+            except BaseException as error:
+                if created:
+                    output.unlink(missing_ok=True)
+                retry = isinstance(error, urllib.error.URLError)
+                if isinstance(error, urllib.error.HTTPError):
+                    retry = error.code in {404, 409, 429, 500, 502, 503, 504}
+                if not retry or time.monotonic() >= deadline:
+                    raise PrivateJobError("Private retained artifact unavailable or invalid") from None
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
+
     def upload(self, archive: Path, exit_code: int, status: str) -> None:
         if not 0 < archive.stat().st_size <= MAX_RESULT:
             raise PrivateJobError("Result archive size limit")
@@ -583,9 +838,15 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
             broker.download(archive, expected_sha256)
             source = workspace / "source"
             extract_source(archive, source)
+            transport = read_artifact_transport(source)
             descriptor = read_artifact_descriptor(source)
             artifact = None
-            if descriptor is not None:
+            if transport is not None:
+                outer = workspace / "private-retained-input.zip"
+                artifact = workspace / "private-input.zip"
+                broker.download_retained_artifact(outer, transport)
+                extract_retained_artifact(outer, artifact, transport, source / ARTIFACT_IDENTITY)
+            elif descriptor is not None:
                 artifact = workspace / "private-input.zip"
                 broker.download_artifact(artifact, descriptor)
             code = execute_private(source, output, timeout_seconds, input_artifact=artifact)
