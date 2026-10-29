@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -134,6 +135,33 @@ def diagnostic_failure(stage: str, error: BaseException) -> dict:
     if isinstance(error, urllib.error.HTTPError) and 100 <= error.code <= 599:
         result["http_status"] = error.code
     return result
+
+
+
+RETAINED_DIAGNOSTIC_STAGES = frozenset({
+    "artifact-request", "artifact-response-identity", "artifact-output-open",
+    "artifact-part-length", "artifact-part-integrity", "artifact-archive-integrity",
+})
+RETAINED_WORKER_ERRORS = frozenset({
+    "invalid_json", "body_too_large", "invalid_token", "unauthorized", "identity_unavailable",
+    "unknown_signing_key", "run_not_allowed", "job_pending", "not_found", "job_expired",
+    "invalid_job_configuration", "job_expiring", "internal_error", "artifact_pending",
+    "artifact_not_configured", "result_storage_unavailable", "invalid_artifact_transport",
+})
+
+
+def retained_failure_diagnostic(stage, error, http_status=None):
+    """Private fixed-value evidence only; never read an HTTP error body."""
+    value = {"stage": stage if isinstance(stage, str) and stage in RETAINED_DIAGNOSTIC_STAGES else "artifact-request"}
+    if type(http_status) is int and 100 <= http_status <= 599:
+        value["http_status"] = http_status
+    if isinstance(error, urllib.error.HTTPError):
+        if type(error.code) is int and 100 <= error.code <= 599:
+            value["http_status"] = error.code
+        reported = (error.headers or {}).get("X-Private-CI-Error")
+        if isinstance(reported, str) and reported in RETAINED_WORKER_ERRORS:
+            value["worker_error"] = reported
+    return value
 
 
 def public_token_endpoint(broker):
@@ -678,48 +706,80 @@ class Broker:
             time.sleep(min(3, max(0, deadline - time.monotonic())))
 
     def download_retained_artifact(self, output: Path, descriptor: dict, *, wait_seconds=90):
-        """Fetch only this consumer's authorized, pinned retained outer ZIP."""
+        """Fetch bounded retained parts with this consumer's fresh OIDC identity."""
         expected = retained_artifact_transport(descriptor)["outer"]
         if output.exists() or output.is_symlink():
             raise PrivateJobError("Private retained input already exists")
         deadline = time.monotonic() + wait_seconds
-        while True:
-            created = False
-            try:
-                with self.request("/artifact", deadline=deadline if wait_seconds else None) as response:
-                    announced = response.headers.get("Content-Length", "")
-                    if (response.status != 200 or not re.fullmatch(r"[1-9][0-9]{0,8}", announced)
-                            or int(announced) != expected["size"]
-                            or response.headers.get("X-Content-Sha256") != expected["sha256"]):
-                        raise PrivateJobError("Retained artifact response identity differs")
-                    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    created = True
-                    whole = hashlib.sha256()
-                    with os.fdopen(fd, "wb") as target:
-                        for part in expected["parts"]:
-                            remaining, digest = part["size"], hashlib.sha256()
-                            while remaining:
-                                data = response.read(min(65536, remaining))
-                                if not data or len(data) > remaining:
+        created, stage, response_status = False, "artifact-output-open", None
+        try:
+            fd = os.open(output, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+            whole = hashlib.sha256()
+            with os.fdopen(fd, "w+b") as target:
+                for part in expected["parts"]:
+                    verified_offset = target.tell()
+                    while True:
+                        try:
+                            stage, response_status = "artifact-request", None
+                            with self.request("/artifact/" + str(part["index"]),
+                                              deadline=deadline if wait_seconds else None) as response:
+                                stage = "artifact-response-identity"
+                                response_status = response.status
+                                announced = response.headers.get("Content-Length", "")
+                                if (response.status != 200 or not re.fullmatch(r"[1-9][0-9]{0,8}", announced)
+                                        or int(announced) != part["size"]
+                                        or response.headers.get("X-Content-Sha256") != part["sha256"]):
+                                    raise PrivateJobError("Retained artifact response identity differs")
+                                remaining, digest, candidate = part["size"], hashlib.sha256(), whole.copy()
+                                stage = "artifact-part-length"
+                                while remaining:
+                                    if wait_seconds > 0 and time.monotonic() >= deadline:
+                                        raise PrivateJobError("Private retained transfer deadline")
+                                    data = response.read(min(65536, remaining))
+                                    if not data or len(data) > remaining:
+                                        raise PrivateJobError("Retained artifact part length differs")
+                                    remaining -= len(data)
+                                    target.write(data)
+                                    digest.update(data)
+                                    candidate.update(data)
+                                if wait_seconds > 0 and time.monotonic() >= deadline:
+                                    raise PrivateJobError("Private retained transfer deadline")
+                                if response.read(1):
                                     raise PrivateJobError("Retained artifact part length differs")
-                                remaining -= len(data)
-                                target.write(data)
-                                digest.update(data)
-                                whole.update(data)
-                            if digest.hexdigest() != part["sha256"]:
-                                raise PrivateJobError("Retained artifact part integrity differs")
-                        if response.read(1) or whole.hexdigest() != expected["sha256"]:
-                            raise PrivateJobError("Retained artifact archive integrity differs")
-                return
-            except BaseException as error:
-                if created:
-                    output.unlink(missing_ok=True)
-                retry = isinstance(error, urllib.error.URLError)
-                if isinstance(error, urllib.error.HTTPError):
-                    retry = error.code in {404, 409, 429, 500, 502, 503, 504}
-                if not retry or time.monotonic() >= deadline:
-                    raise PrivateJobError("Private retained artifact unavailable or invalid") from None
-            time.sleep(min(3, max(0, deadline - time.monotonic())))
+                                stage = "artifact-part-integrity"
+                                if digest.hexdigest() != part["sha256"]:
+                                    raise PrivateJobError("Retained artifact part integrity differs")
+                            stage = "artifact-part-length"
+                            if wait_seconds > 0 and time.monotonic() >= deadline:
+                                raise PrivateJobError("Private retained transfer deadline")
+                            whole = candidate
+                            break
+                        except BaseException as error:
+                            # The prefix is already verified. Discard only bytes from
+                            # this failed attempt; its candidate hash is never adopted.
+                            target.seek(verified_offset)
+                            target.truncate()
+                            retry = isinstance(error, (urllib.error.URLError, http.client.IncompleteRead,
+                                http.client.RemoteDisconnected, ConnectionResetError, TimeoutError))
+                            if isinstance(error, urllib.error.HTTPError):
+                                retry = error.code in {404, 409, 429, 500, 502, 503, 504}
+                            if not retry or time.monotonic() >= deadline:
+                                raise
+                            time.sleep(min(3, max(0, deadline - time.monotonic())))
+                stage = "artifact-archive-integrity"
+                if wait_seconds > 0 and time.monotonic() >= deadline:
+                    raise PrivateJobError("Private retained transfer deadline")
+                if target.tell() != expected["size"] or whole.hexdigest() != expected["sha256"]:
+                    raise PrivateJobError("Retained artifact archive integrity differs")
+                if wait_seconds > 0 and time.monotonic() >= deadline:
+                    raise PrivateJobError("Private retained transfer deadline")
+        except BaseException as error:
+            if created:
+                output.unlink(missing_ok=True)
+            failure = PrivateJobError("Private retained artifact unavailable or invalid")
+            failure.retained_diagnostic = retained_failure_diagnostic(stage, error, response_status)
+            raise failure from None
 
     def upload(self, archive: Path, exit_code: int, status: str) -> None:
         if not 0 < archive.stat().st_size <= MAX_RESULT:
@@ -851,10 +911,21 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
                 broker.download_artifact(artifact, descriptor)
             code = execute_private(source, output, timeout_seconds, input_artifact=artifact)
             status = "pass" if code == 0 else "fail"
-        except BaseException:
+        except BaseException as error:
             # The private log is the only place an error may contain job data.
             import traceback
             (output / "launcher-error.log").write_text(traceback.format_exc())
+            diagnostic = getattr(error, "retained_diagnostic", None)
+            if isinstance(diagnostic, dict):
+                # Revalidate even internally attached data before retaining it.
+                safe = {"stage": diagnostic.get("stage")}
+                if safe["stage"] in RETAINED_DIAGNOSTIC_STAGES:
+                    if type(diagnostic.get("http_status")) is int and 100 <= diagnostic["http_status"] <= 599:
+                        safe["http_status"] = diagnostic["http_status"]
+                    if (isinstance(diagnostic.get("worker_error"), str)
+                            and diagnostic["worker_error"] in RETAINED_WORKER_ERRORS):
+                        safe["worker_error"] = diagnostic["worker_error"]
+                    (output / "launcher-diagnostic.json").write_text(json.dumps(safe, sort_keys=True))
             code, status = 1, "error"
         archive = workspace / "results.zip"
         result_archive(output, archive)
