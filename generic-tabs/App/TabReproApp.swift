@@ -5,7 +5,9 @@ import UIKit
 struct TabReproApp: App {
     var body: some Scene {
         WindowGroup {
-            TabRepro(mode: ProcessInfo.processInfo.environment["REPRO_MODE"] ?? "baseline")
+            let mode = ProcessInfo.processInfo.environment["REPRO_MODE"] ?? "baseline"
+            if mode.hasPrefix("anchor-") { NativePreferenceProbe(mode: mode) }
+            else { TabRepro(mode: mode) }
         }
     }
 }
@@ -323,5 +325,42 @@ struct NativeControllerProbe: UIViewRepresentable {
             if let data = try? JSONSerialization.data(withJSONObject: observations, options: [.sortedKeys]),
                let text = String(data: data, encoding: .utf8) { accessibilityValue = text }
         }
+    }
+}
+
+
+private struct GenericLabelsKey: PreferenceKey {
+    static var defaultValue: [String] { [] }
+    static func reduce(value: inout [String], nextValue: () -> [String]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+/// Independent generic test of the public SwiftUI preference primitives.
+private struct NativePreferenceProbe: View {
+    let mode: String
+    @State private var observed: [String] = []
+    private var leaf: some View {
+        Text("Item 1").padding()
+            .anchorPreference(key: GenericLabelsKey.self, value: .bounds) { _ in ["Item 1"] }
+    }
+    @ViewBuilder private var nested: some View {
+        if mode == "anchor-writer" {
+            VStack { leaf }
+                .anchorPreference(key: GenericLabelsKey.self, value: .bounds) { _ in ["Item 2"] }
+        } else {
+            VStack { leaf }
+                .transformAnchorPreference(key: GenericLabelsKey.self, value: .bounds) { values, _ in
+                    values.append("Item 2")
+                }
+        }
+    }
+    var body: some View {
+        nested
+            .onPreferenceChange(GenericLabelsKey.self) { observed = $0 }
+            .overlay(alignment: .bottom) {
+                Text(observed.joined(separator: ","))
+                    .accessibilityIdentifier("actual-native-preferences")
+            }
     }
 }

@@ -16,6 +16,23 @@ final class TabReproTests: XCTestCase {
     func testHoldDisableTrace() throws { try traceHold("hold-disable") }
     func testHoldKeepEnabledTrace() throws { try traceHold("hold-keep-enabled") }
 
+    func testNativeAnchorRegistrationSemantics() throws {
+        for (mode, expected) in [("anchor-writer", "Item 2"), ("anchor-transform", "Item 1,Item 2")] {
+            let app = XCUIApplication()
+            app.launchEnvironment["REPRO_MODE"] = mode
+            app.launch()
+            let actual = app.staticTexts["actual-native-preferences"]
+            let predicate = NSPredicate(format: "exists == true AND label == %@", expected)
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: actual)], timeout: 10), .completed)
+            let observation = XCTAttachment(string: "mode=\(mode) actual=\(actual.label)")
+            observation.name = "\(mode)-actual-native-preferences"; observation.lifetime = .keepAlways; add(observation)
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.name = "\(mode)-actual-screen"; screenshot.lifetime = .keepAlways; add(screenshot)
+            XCTAssertEqual(actual.label, expected)
+            app.terminate()
+        }
+    }
+
     private func traceHold(_ mode: String) throws {
         continueAfterFailure = true
         let app = XCUIApplication()
