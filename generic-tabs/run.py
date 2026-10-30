@@ -1,4 +1,4 @@
-import json, os, pathlib, shutil, subprocess, sys, uuid, signal, threading, time
+import json, os, pathlib, shutil, subprocess, sys, uuid, signal, threading, time, re
 
 root = pathlib.Path(__file__).resolve().parent
 output = root / "results"
@@ -16,7 +16,12 @@ sim = None
 recorder = None
 recording_timer = None
 exit_code = 1
+selected_test = "GenericNativeTabsTests/TabReproTests/testCombinedNativeHoldWindow"
 try:
+    method = selected_test.rsplit("/", 1)[1]
+    tests_source = (root / "Tests/TabReproTests.swift").read_text()
+    if len(re.findall(r"^\s*func " + re.escape(method) + r"\(", tests_source, re.MULTILINE)) != 1:
+        raise ValueError("The selected native testcase must exist exactly once before simulator work.")
     data = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "-j"], env=env))
     device = next(d for d in data["devicetypes"] if d["name"] == "iPhone 13 mini")
     supported = [r for r in data["runtimes"] if r.get("isAvailable") and ".iOS-" in r["identifier"]
@@ -35,20 +40,11 @@ try:
     run(["xcrun", "simctl", "bootstatus", sim, "-b"], "bootstatus.log", 180)
     runs = list((root / "DerivedData/Build/Products").glob("*.xctestrun"))
     if len(runs) != 1: raise ValueError("Expected one generated xctestrun")
-    # Bounded recording is evidence of real native gesture/HUD behavior only.
-    recording_log = (output / "recording.log").open("wb")
-    recorder = subprocess.Popen(["xcrun", "simctl", "io", sim, "recordVideo", "--codec=h264", "--force",
-        str(output / "actual-hold.mov")], env=env, stdout=recording_log, stderr=subprocess.STDOUT)
-    def stop_recording():
-        if recorder and recorder.poll() is None: recorder.send_signal(signal.SIGINT)
-    recording_timer = threading.Timer(90, stop_recording)
-    recording_timer.start()
     result = run(["xcodebuild", "test-without-building", "-xctestrun", runs[0], "-destination", "id=" + sim,
         "-parallel-testing-enabled", "NO", "-test-timeouts-enabled", "YES",
         "-default-test-execution-time-allowance", "330", "-maximum-test-execution-time-allowance", "360",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldDisableTrace",
-        "-only-testing:GenericNativeTabsTests/TabReproTests/testHoldKeepEnabledTrace",
-        "-resultBundlePath", output / "native.xcresult"], "test.log", 360, check=False)
+        "-only-testing:" + selected_test,
+        "-resultBundlePath", output / "native.xcresult"], "test.log", 390, check=False)
     exit_code = result.returncode
 except Exception as error:
     (output / "error.json").write_text(json.dumps({"kind": type(error).__name__, "message": str(error)}, indent=2))
@@ -64,9 +60,43 @@ finally:
                            ("attachments-export.log", ["export", "attachments", "--path", result, "--output-path", output / "attachments"])):
             try: run(["xcrun", "xcresulttool", *argv], name, 20, check=False)
             except Exception as error: (output / (name + ".error")).write_text(type(error).__name__)
+    # Keep finalized native summary and original requested PNG/JSON attachments.
+    # Full raw bundles and automatic videos are intentionally omitted from this
+    # small generic experiment artifact; their SHA-256 manifest stays explicit.
+    import hashlib
+    omitted = []
+    for path in sorted(output.rglob("*")):
+        if path.is_file() and ("native.xcresult" in path.parts or path.suffix in {".mp4", ".mov"}):
+            omitted.append({"path": str(path.relative_to(output)), "bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    (output / "artifact-policy.json").write_text(json.dumps({
+        "kind": "finalized-summary-and-original-exported-attachments",
+        "raw_xcresult_retained": False, "automatic_videos_retained": False,
+        "omitted_members": omitted}, indent=2))
+    if result.is_dir(): shutil.rmtree(result)
+    for path in output.rglob("*"):
+        if path.is_file() and path.suffix in {".mp4", ".mov"}: path.unlink()
     if sim:
         for command in ("shutdown", "delete"):
             try: subprocess.run(["xcrun", "simctl", command, sim], env=env, capture_output=True, timeout=5)
             except Exception: pass
-    (output / "run-exit.json").write_text(json.dumps({"test_process_exit_code": exit_code, "app_source": "generic-public-repro-only"}))
+    process_exit_code = exit_code
+    try:
+        actual_summary = json.loads((output / "summary.json").read_text())
+        counts_match = (actual_summary.get("totalTestCount") == 1
+            and actual_summary.get("passedTests") == 1
+            and actual_summary.get("failedTests") == 0
+            and actual_summary.get("skippedTests") == 0
+            and actual_summary.get("result") == "Passed")
+    except (OSError, ValueError):
+        counts_match = False
+    if not counts_match:
+        exit_code = 1
+    (output / "run-exit.json").write_text(json.dumps({
+        "test_process_exit_code": process_exit_code,
+        "strict_finalized_counts_gate_passed": counts_match,
+        "expected_test_count": 1,
+        "selected_test": selected_test,
+        "final_exit_code": exit_code,
+        "app_source": "generic-public-repro-only"}))
 sys.exit(exit_code)
