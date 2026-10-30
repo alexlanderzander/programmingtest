@@ -23,9 +23,12 @@ struct TabRepro: View {
     @State private var pendingTask: Task<Void, Never>?
     @State private var heldIndex: Int?
 
+    private var combined: Bool { mode.hasPrefix("hold-combined") }
+    private var atomic: Bool { mode == "hold-combined-atomic" }
+
     private var visible: [Int] { [0] + Array((windowStart + 1)...(windowStart + 4)) }
     private var selection: Binding<Int> {
-        if mode == "binding-guard" || mode == "hold-guard" {
+        if mode == "binding-guard" || mode == "hold-guard" || combined {
             Binding(get: { selected }, set: { value in
                 guard pendingSelection == nil || pendingSelection == value else { return }
                 move(to: value)
@@ -34,7 +37,8 @@ struct TabRepro: View {
     }
 
     private func move(to next: Int) {
-        if mode == "visited-gating" { visited.insert(next) }
+        if mode == "visited-gating" || (combined && !atomic) { visited.insert(next) }
+        if combined && !atomic { columns = .detailOnly; compactColumn = .detail }
         var start = windowStart
         if next > 0 {
             if next - 1 < start { start = next - 1 }
@@ -43,8 +47,14 @@ struct TabRepro: View {
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
+            if atomic {
+                visited.insert(next)
+                columns = .detailOnly
+                compactColumn = .detail
+                heldIndex = nil
+            }
             windowStart = start
-            if mode == "binding-guard" || mode == "hold-guard" {
+            if mode == "binding-guard" || mode == "hold-guard" || combined {
                 pendingSelection = next
                 pendingTask?.cancel()
                 // This mode reproduces a suspected callback guard, not a
@@ -65,7 +75,18 @@ struct TabRepro: View {
     }
 
     @ViewBuilder private func page(_ index: Int) -> some View {
-        if mode == "visited-gating" {
+        if combined {
+            if visited.contains(index) {
+                NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+                    List { Text("Generic sidebar") }
+                } detail: {
+                    NavigationStack { ReproPage(index: index) }
+                        .accessibilityHidden(index != selected)
+                }
+                .navigationSplitViewStyle(.balanced)
+                .toolbar(removing: .sidebarToggle)
+            }
+        } else if mode == "visited-gating" {
             if visited.contains(index) { ReproPage(index: index) }
         } else if mode == "split-columns" {
             NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
@@ -118,11 +139,19 @@ struct TabRepro: View {
                 Text("Holding Item \(heldIndex + 1)")
                     .padding().background(.regularMaterial, in: Capsule())
                     .accessibilityIdentifier("actual-held-target")
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         .background {
             GenericNativeHold(enabled: mode.hasPrefix("hold-"), disableBar: mode != "hold-keep-enabled",
-                              heldChanged: { heldIndex = $0 }, commit: move)
+                              heldChanged: { next in
+                                  if combined {
+                                      guard heldIndex != next else { return }
+                                      if next == nil { withAnimation(.easeOut(duration: 0.2)) { heldIndex = nil } }
+                                      else if heldIndex == nil { withAnimation(.spring(duration: 0.3)) { heldIndex = next } }
+                                      else { heldIndex = next }
+                                  } else { heldIndex = next }
+                              }, commit: move)
                 .frame(width: 1, height: 1)
         }
     }
@@ -242,10 +271,10 @@ struct GenericNativeHold: UIViewRepresentable {
                 log("before-restore", recognizer: recognizer)
                 heldBar?.isUserInteractionEnabled = priorInteraction
                 log("after-restore", recognizer: recognizer)
-                heldChanged(nil)
                 log("before-commit", recognizer: recognizer)
                 commit(lastIndex)
                 log("after-commit", recognizer: recognizer)
+                heldChanged(nil)
                 heldBar = nil
             default: break
             }
@@ -301,14 +330,11 @@ struct NativeControllerProbe: UIViewRepresentable {
                 let selected = bar.selectedItem
                 let items = bar.items ?? []
                 let before = items.map { $0.accessibilityTraits.rawValue }
-                if mode == "native-traits", let selected {
-                    for item in items {
-                        if item === selected { item.accessibilityTraits.insert(.selected) }
-                        else { item.accessibilityTraits.remove(.selected) }
-                    }
-                }
                 observations.append([
+                    "observed_uptime": ProcessInfo.processInfo.systemUptime,
                     "controller_selected_index": tabs.selectedIndex,
+                    "selected_item_identity": selected.map { String(describing: ObjectIdentifier($0)) } ?? "<nil>",
+                    "item_identities": items.map { String(describing: ObjectIdentifier($0)) },
                     "bar_selected_title": selected?.title ?? "<nil>",
                     "item_titles": items.map { $0.title ?? "<nil>" },
                     "item_traits_before": before,
