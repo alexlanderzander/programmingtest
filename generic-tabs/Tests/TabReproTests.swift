@@ -7,9 +7,9 @@ final class TabReproTests: XCTestCase {
         continueAfterFailure = true
         let reproduced = try exerciseCombined("hold-combined")
         let decision = XCTAttachment(string: reproduced
-            ? "Baseline observed multiple hittable selected native tabs while the real requested page was visible. Preserve finalized evidence before any candidate run."
-            : "Baseline did not reproduce multiple selected native tabs. The candidate is not executed; no Atlas fix is established.")
-        decision.name = "combined-native-conditional-candidate-decision"
+            ? "The State-owned window repair probe still observed multiple selected native tabs. Preserve the finalized failure evidence."
+            : "The State-owned window repair probe observed no duplicated selection. Finalized route, state and saved-window assertions remain authoritative; actual Atlas validation is pending.")
+        decision.name = "state-owned-window-candidate-observation"
         decision.lifetime = .keepAlways
         add(decision)
     }
@@ -129,6 +129,83 @@ final class TabReproTests: XCTestCase {
         }
         XCTAssertEqual(app.staticTexts["state.0"].label, identity)
         XCTAssertEqual(app.textFields["draft.0"].value as? String, "Generic unsent draft")
+
+        func actualNativeProbe() throws -> [[String: Any]] {
+            let probe = app.descendants(matching: .any).matching(identifier: "native-controller-probe").firstMatch
+            let ready = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == true AND value CONTAINS %@", "\"process_id\""), object: probe)
+            XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: min(10, max(0.1, deadline.timeIntervalSinceNow))), .completed)
+            let text = try XCTUnwrap(probe.value as? String)
+            let data = try XCTUnwrap(text.data(using: .utf8))
+            return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        }
+        let beforeNative = try actualNativeProbe()
+        XCTAssertEqual(beforeNative.count, 1)
+        let before = try XCTUnwrap(beforeNative.first)
+        let savedWindow = try XCTUnwrap(before["saved_window_value"] as? Int)
+        let observedWindow = try XCTUnwrap(before["view_owned_window_start"] as? Int)
+        let beforePID = try XCTUnwrap(before["process_id"] as? Int)
+        let beforeDraft = app.textFields["draft.0"].value as? String ?? "<unavailable>"
+        XCTAssertEqual(savedWindow, observedWindow)
+        XCTAssertTrue((0...9).contains(savedWindow))
+        guard (0...9).contains(savedWindow), Date() < deadline else {
+            XCTFail("The saved native window or bounded relaunch precondition is unavailable.")
+            return reproduced
+        }
+        let expectedLabels = ["Item 1"] + ((savedWindow + 2)...(savedWindow + 5)).map { "Item \($0)" }
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.staticTexts["page.0"].waitForExistence(timeout: min(30, max(0.1, deadline.timeIntervalSinceNow))))
+        let relaunchedBar = app.tabBars.firstMatch
+        XCTAssertTrue(relaunchedBar.waitForExistence(timeout: min(10, max(0.1, deadline.timeIntervalSinceNow))) && relaunchedBar.isHittable)
+        let afterNative = try actualNativeProbe()
+        XCTAssertEqual(afterNative.count, 1)
+        let after = try XCTUnwrap(afterNative.first)
+        let afterPID = try XCTUnwrap(after["process_id"] as? Int)
+        let newIdentity = app.staticTexts["state.0"].label
+        let restoredBars = app.tabBars.allElementsBoundByAccessibilityElement.filter {
+            $0.exists && $0.isHittable && !$0.frame.isEmpty && $0.frame.intersects(app.frame)
+        }
+        let restoredButtons = restoredBars.flatMap { bar in
+            bar.buttons.allElementsBoundByAccessibilityElement.map {
+                ["label": $0.label, "selected": String($0.isSelected), "hittable": String($0.isHittable)]
+            }
+        }
+        let restoredLabels = restoredButtons.filter { $0["hittable"] == "true" }.map { $0["label"] ?? "" }
+        let restoredSelected = restoredButtons.filter {
+            $0["hittable"] == "true" && $0["selected"] == "true"
+        }.map { $0["label"] ?? "" }
+        let restoration: [String: Any] = ["stage": "saved-window-relaunch",
+            "before_native_state": beforeNative, "after_native_state": afterNative,
+            "before_page_uuid": identity, "after_page_uuid": newIdentity,
+            "before_draft": beforeDraft,
+            "after_draft": app.textFields["draft.0"].value as? String ?? "<unavailable>",
+            "actual_buttons": restoredButtons, "actual_visible_labels": restoredLabels,
+            "actual_selected_labels": restoredSelected,
+            "expected_titles_from_measured_saved_window": expectedLabels,
+            "saved_window_directly_observed_in_app_process": true]
+        let restoreData = try JSONSerialization.data(withJSONObject: restoration, options: [.prettyPrinted, .sortedKeys])
+        let restoreRecord = XCTAttachment(data: restoreData, uniformTypeIdentifier: "public.json")
+        restoreRecord.name = "actual-saved-window-relaunch"
+        restoreRecord.lifetime = .keepAlways
+        add(restoreRecord)
+        let restoreTree = XCTAttachment(string: app.debugDescription)
+        restoreTree.name = "actual-saved-window-relaunch-accessibility-tree"
+        restoreTree.lifetime = .keepAlways
+        add(restoreTree)
+        let restoreImage = XCTAttachment(screenshot: app.screenshot())
+        restoreImage.name = "actual-saved-window-relaunch-screen"
+        restoreImage.lifetime = .keepAlways
+        add(restoreImage)
+        XCTAssertEqual(restoredBars.count, 1)
+        XCTAssertEqual(restoredLabels, expectedLabels)
+        XCTAssertEqual(restoredSelected, ["Item 1"])
+        XCTAssertEqual(after["saved_window_value"] as? Int, savedWindow)
+        XCTAssertEqual(after["view_owned_window_start"] as? Int, savedWindow)
+        XCTAssertNotEqual(afterPID, beforePID)
+        XCTAssertNotEqual(newIdentity, identity)
+        XCTAssertNotNil(UUID(uuidString: newIdentity))
+        XCTAssertGreaterThan(deadline.timeIntervalSinceNow, 0, "The bounded saved-window relaunch check expired.")
         return reproduced
     }
 }
