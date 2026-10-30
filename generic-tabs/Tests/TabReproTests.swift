@@ -7,12 +7,11 @@ final class TabReproTests: XCTestCase {
         continueAfterFailure = true
         let reproduced = try exerciseCombined("hold-combined")
         let decision = XCTAttachment(string: reproduced
-            ? "Baseline observed multiple hittable selected native tabs while the real requested page was visible. Run the one atomic-transaction candidate."
+            ? "Baseline observed multiple hittable selected native tabs while the real requested page was visible. Preserve finalized evidence before any candidate run."
             : "Baseline did not reproduce multiple selected native tabs. The candidate is not executed; no Atlas fix is established.")
         decision.name = "combined-native-conditional-candidate-decision"
         decision.lifetime = .keepAlways
         add(decision)
-        if reproduced { _ = try exerciseCombined("hold-combined-atomic") }
     }
 
     private func exerciseCombined(_ mode: String) throws -> Bool {
