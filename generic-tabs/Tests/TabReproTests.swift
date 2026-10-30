@@ -15,7 +15,7 @@ final class TabReproTests: XCTestCase {
     }
 
     private func exerciseCombined(_ mode: String) throws -> Bool {
-        let deadline = Date().addingTimeInterval(150)
+        let deadline = Date().addingTimeInterval(210)
         let app = XCUIApplication()
         app.launchEnvironment["REPRO_MODE"] = mode
         app.launch()
@@ -25,8 +25,9 @@ final class TabReproTests: XCTestCase {
         app.textFields["draft.0"].tap()
         app.textFields["draft.0"].typeText("Generic unsent draft")
         app.buttons["hide-keyboard"].tap()
+        let startingDraft = app.textFields["draft.0"].value as? String ?? "<unavailable>"
         var reproduced = false
-        for (step, target) in [4, 5, 6, 0].enumerated() {
+        for (step, target) in [1, 2, 3, 4, 5, 6, 0].enumerated() {
             guard Date() < deadline else {
                 XCTFail("The bounded combined native arm expired.")
                 return reproduced
@@ -61,6 +62,11 @@ final class TabReproTests: XCTestCase {
             let hud = app.staticTexts["actual-held-target"].exists
             let record: [String: Any] = ["mode": mode, "step": step, "requested_item": target + 1,
                 "observed_at": ISO8601DateFormatter().string(from: Date()),
+                "journey_phase": step < 4 ? "warmup" : "window-target",
+                "actual_page_uuid": app.staticTexts["state.\(target)"].label,
+                "actual_page_draft": app.textFields["draft.\(target)"].value as? String ?? "<unavailable>",
+                "actual_initial_page_uuid": identity,
+                "actual_initial_page_draft": startingDraft,
                 "did_reach_requested_page": reached, "actual_buttons": actualButtons,
                 "visible_bar_count": bars.count, "actual_selection_label": actualLabel,
                 "actual_hold_events": traceText,
