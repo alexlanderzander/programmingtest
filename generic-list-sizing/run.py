@@ -18,6 +18,7 @@ ENV = dict(os.environ, DEVELOPER_DIR="/Applications/Xcode_27.1.app/Contents/Deve
 BUNDLE = "org.example.generic-list-sizing"
 GLOBAL_DEADLINE = time.monotonic() + 720
 VARIANTS = ("outerFit", "candidateFit", "combinedFit", "horizontal", "adaptive", "labeled")
+PHASE_TIMINGS = []
 REQUIRED = {"window", "detail", "reference", "card", "card_content", "marker", "summary", "title", "hint", "progress"}
 
 
@@ -26,12 +27,24 @@ def run(arguments, log_name, timeout, check=True):
     if remaining <= 0:
         raise TimeoutError("Global 12-minute measurement deadline exhausted")
     timeout = min(timeout, remaining)
-    with (OUT / log_name).open("wb") as log:
-        completed = subprocess.run(list(map(str, arguments)), cwd=ROOT, env=ENV,
-                                   stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
-    if check and completed.returncode:
-        raise RuntimeError(f"{log_name}: exit {completed.returncode}")
-    return completed
+    began = time.monotonic()
+    observation = {"phase": log_name, "actual_timeout_seconds": timeout,
+                   "argv": list(map(str, arguments)), "exit_code": None, "timed_out": False}
+    try:
+        with (OUT / log_name).open("wb") as log:
+            completed = subprocess.run(list(map(str, arguments)), cwd=ROOT, env=ENV,
+                                       stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        observation["exit_code"] = completed.returncode
+        if check and completed.returncode:
+            raise RuntimeError(f"{log_name}: exit {completed.returncode}")
+        return completed
+    except subprocess.TimeoutExpired:
+        observation["timed_out"] = True
+        raise
+    finally:
+        observation["elapsed_seconds"] = time.monotonic() - began
+        PHASE_TIMINGS.append(observation)
+        (OUT / "phase-timings.json").write_text(json.dumps(PHASE_TIMINGS, indent=2))
 
 
 def read_stable_geometry(path, token):
@@ -96,14 +109,19 @@ try:
          "-configuration", "Debug", "-destination", "id=" + sim,
          "-derivedDataPath", ROOT / "DerivedData", "-jobs", "1", "CODE_SIGNING_ALLOWED=NO"], "build.log", 180)
     run(["xcrun", "simctl", "boot", sim], "boot.log", 120)
-    run(["xcrun", "simctl", "bootstatus", sim, "-b"], "bootstatus.log", 180)
+    run(["xcrun", "simctl", "bootstatus", sim, "-b"], "bootstatus.log", 600)
     app = ROOT / "DerivedData/Build/Products/Debug-iphonesimulator/GenericListSizing.app"
     run(["xcrun", "simctl", "install", sim, app], "install.log", 180)
     container = pathlib.Path(subprocess.check_output(
         ["xcrun", "simctl", "get_app_container", sim, BUNDLE, "data"], env=ENV, text=True, timeout=min(30, max(1, GLOBAL_DEADLINE-time.monotonic()))).strip())
     geometry_file = container / "Documents/measurement.json"
-    cases = [dict(variant=variant, decorated=decorated, symbol_hint=symbol_hint, accessibility_size=False)
-             for variant, decorated, symbol_hint in itertools.product(VARIANTS, (False, True), (False, True))]
+    # The six cases closest to the observed failure come first so a bounded
+    # partial run remains informative without claiming the full 30-case matrix.
+    cases = [dict(variant=variant, decorated=True, symbol_hint=True, accessibility_size=False)
+             for variant in VARIANTS]
+    cases += [dict(variant=variant, decorated=decorated, symbol_hint=symbol_hint, accessibility_size=False)
+              for variant, decorated, symbol_hint in itertools.product(VARIANTS, (False, True), (False, True))
+              if not (decorated and symbol_hint)]
     # AX5 comparison is useful after normal-size isolation. It is a separate case,
     # and cannot turn the measured normal-size finding into a general pass.
     cases += [dict(variant=variant, decorated=True, symbol_hint=True, accessibility_size=True)
