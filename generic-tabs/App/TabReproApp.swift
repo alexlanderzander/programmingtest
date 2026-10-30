@@ -15,7 +15,7 @@ struct TabReproApp: App {
 struct TabRepro: View {
     let mode: String
     @State private var selected = 0
-    @State private var windowStart = 0
+    @AppStorage("compactTabWindowStart") private var windowStart = 0
     @State private var columns: NavigationSplitViewVisibility = .detailOnly
     @State private var compactColumn: NavigationSplitViewColumn = .detail
     @State private var visited: Set<Int> = [0]
