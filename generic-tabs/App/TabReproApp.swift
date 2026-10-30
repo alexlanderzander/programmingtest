@@ -15,7 +15,7 @@ struct TabReproApp: App {
 struct TabRepro: View {
     let mode: String
     @State private var selected = 0
-    @AppStorage("compactTabWindowStart") private var windowStart = 0
+    @State private var windowStart = UserDefaults.standard.integer(forKey: "compactTabWindowStart")
     @State private var columns: NavigationSplitViewVisibility = .detailOnly
     @State private var compactColumn: NavigationSplitViewColumn = .detail
     @State private var visited: Set<Int> = [0]
@@ -132,8 +132,11 @@ struct TabRepro: View {
                 }
             }
         }
+        .onChange(of: windowStart) { _, value in
+            UserDefaults.standard.set(value, forKey: "compactTabWindowStart")
+        }
         .overlay(alignment: .topLeading) {
-            NativeControllerProbe(mode: mode, generation: selected)
+            NativeControllerProbe(mode: mode, generation: selected, windowStart: windowStart)
                 .frame(width: 1, height: 1)
         }
         .overlay(alignment: .top) {
@@ -302,14 +305,17 @@ struct ReproPage: View {
 struct NativeControllerProbe: UIViewRepresentable {
     let mode: String
     let generation: Int
+    let windowStart: Int
     func makeUIView(context: Context) -> ProbeView { ProbeView() }
     func updateUIView(_ view: ProbeView, context: Context) {
         view.mode = mode
+        view.windowStart = windowStart
         view.setNeedsLayout()
     }
 
     final class ProbeView: UIView {
         var mode = "baseline"
+        var windowStart = 0
         override init(frame: CGRect) {
             super.init(frame: frame)
             isUserInteractionEnabled = false
@@ -334,6 +340,9 @@ struct NativeControllerProbe: UIViewRepresentable {
                 let before = items.map { $0.accessibilityTraits.rawValue }
                 observations.append([
                     "observed_uptime": ProcessInfo.processInfo.systemUptime,
+                    "process_id": ProcessInfo.processInfo.processIdentifier,
+                    "view_owned_window_start": windowStart,
+                    "saved_window_value": UserDefaults.standard.object(forKey: "compactTabWindowStart") ?? NSNull(),
                     "controller_selected_index": tabs.selectedIndex,
                     "selected_item_identity": selected.map { String(describing: ObjectIdentifier($0)) } ?? "<nil>",
                     "item_identities": items.map { String(describing: ObjectIdentifier($0)) },
