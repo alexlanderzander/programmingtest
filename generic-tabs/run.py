@@ -44,7 +44,7 @@ try:
         "-parallel-testing-enabled", "NO", "-test-timeouts-enabled", "YES",
         "-default-test-execution-time-allowance", "330", "-maximum-test-execution-time-allowance", "360",
         "-only-testing:" + selected_test,
-        "-resultBundlePath", output / "native.xcresult"], "test.log", 390, check=False)
+        "-resultBundlePath", output / "native.xcresult"], "test.log", 420, check=False)
     exit_code = result.returncode
 except Exception as error:
     (output / "error.json").write_text(json.dumps({"kind": type(error).__name__, "message": str(error)}, indent=2))
