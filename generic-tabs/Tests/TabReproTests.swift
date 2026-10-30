@@ -21,6 +21,34 @@ final class TabReproTests: XCTestCase {
         app.launch()
         defer { app.terminate() }
         XCTAssertTrue(app.staticTexts["page.0"].waitForExistence(timeout: 30))
+        let initialBar = app.tabBars.firstMatch
+        XCTAssertTrue(initialBar.waitForExistence(timeout: 10) && initialBar.isHittable)
+        let initialBars = app.tabBars.allElementsBoundByAccessibilityElement.filter {
+            $0.exists && $0.isHittable && !$0.frame.isEmpty && $0.frame.intersects(app.frame)
+        }
+        let initialButtons = initialBars.flatMap { bar in
+            bar.buttons.allElementsBoundByAccessibilityElement.map {
+                ["label": $0.label, "selected": String($0.isSelected), "hittable": String($0.isHittable)]
+            }
+        }
+        let initialVisibleLabels = initialButtons.filter { $0["hittable"] == "true" }.map { $0["label"] ?? "" }
+        let initialSelectedLabels = initialButtons.filter {
+            $0["hittable"] == "true" && $0["selected"] == "true"
+        }.map { $0["label"] ?? "" }
+        let initialRecord: [String: Any] = ["stage": "initial-fixture",
+            "visible_native_bar_count": initialBars.count,
+            "actual_buttons": initialButtons, "actual_visible_labels": initialVisibleLabels,
+            "actual_selected_labels": initialSelectedLabels,
+            "actual_page_label": app.staticTexts["selection"].label,
+            "storage_value_directly_read": false]
+        let initialData = try JSONSerialization.data(withJSONObject: initialRecord, options: [.prettyPrinted, .sortedKeys])
+        let initialAttachment = XCTAttachment(data: initialData, uniformTypeIdentifier: "public.json")
+        initialAttachment.name = "actual-initial-native-tab-window"
+        initialAttachment.lifetime = .keepAlways
+        add(initialAttachment)
+        XCTAssertEqual(initialBars.count, 1)
+        XCTAssertEqual(initialVisibleLabels, (1...5).map { "Item \($0)" })
+        XCTAssertEqual(initialSelectedLabels, ["Item 1"])
         let identity = app.staticTexts["state.0"].label
         app.textFields["draft.0"].tap()
         app.textFields["draft.0"].typeText("Generic unsent draft")
