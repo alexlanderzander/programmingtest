@@ -81,7 +81,9 @@ struct TabRepro: View {
                     List { Text("Generic sidebar") }
                 } detail: {
                     NavigationStack { ReproPage(index: index) }
+                        .accessibilityElement(children: .contain)
                         .accessibilityHidden(index != selected)
+                        .toolbarVisibility(.visible, for: .tabBar)
                 }
                 .navigationSplitViewStyle(.balanced)
                 .toolbar(removing: .sidebarToggle)
