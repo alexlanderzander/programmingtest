@@ -1,0 +1,36 @@
+name: Generic native List sizing experiment
+on:
+  push:
+    branches: [main]
+    paths: ['generic-list-sizing/**', '.github/workflows/generic-native-list-sizing.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: generic-native-list-sizing-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  measure:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - name: Fetch generic experiment files at this immutable commit
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,urllib.request
+          base='https://raw.githubusercontent.com/'+os.environ['GITHUB_REPOSITORY']+'/'+os.environ['GITHUB_SHA']+'/'
+          for name in ['generic-list-sizing/App/ListSizingApp.swift','generic-list-sizing/project.yml','generic-list-sizing/run.py']:
+              target=pathlib.Path(name);target.parent.mkdir(parents=True,exist_ok=True)
+              with urllib.request.urlopen(base+name,timeout=30) as response: target.write_bytes(response.read())
+          PY
+      - name: Compile once and measure actual native list geometry
+        run: python3 generic-list-sizing/run.py
+      - name: Preserve original simulator screenshots and native geometry
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: generic-native-list-sizing
+          path: generic-list-sizing/results
+          include-hidden-files: true
+          retention-days: 30
