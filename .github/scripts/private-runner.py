@@ -140,7 +140,7 @@ def diagnostic_failure(stage: str, error: BaseException) -> dict:
 
 RETAINED_DIAGNOSTIC_STAGES = frozenset({
     "artifact-request", "artifact-response-identity", "artifact-output-open",
-    "artifact-part-length", "artifact-part-integrity", "artifact-archive-integrity",
+    "artifact-part-length", "artifact-part-integrity", "artifact-archive-length", "artifact-archive-integrity",
 })
 RETAINED_WORKER_ERRORS = frozenset({
     "invalid_json", "body_too_large", "invalid_token", "unauthorized", "identity_unavailable",
@@ -674,25 +674,37 @@ class Broker:
         deadline = time.monotonic() + wait_seconds
         while True:
             created = False
+            stage, response_status, written = "artifact-request", None, 0
+            matches = {}
             try:
                 with self.request("/artifact", deadline=deadline if wait_seconds else None) as response:
+                    stage, response_status = "artifact-response-identity", response.status
                     announced = response.headers.get("Content-Length", "")
-                    if (response.status != 200 or not re.fullmatch(r"[1-9][0-9]{0,8}", announced)
-                            or int(announced) != expected["size"]):
+                    matches["content_length_matches"] = bool(re.fullmatch(r"[1-9][0-9]{0,8}", announced)
+                        and int(announced) == expected["size"])
+                    matches["sha256_header_matches"] = response.headers.get("X-Content-Sha256") == expected["sha256"]
+                    if response.status != 200 or not matches["content_length_matches"]:
                         raise PrivateJobError("Private artifact size mismatch")
-                    if response.headers.get("X-Content-Sha256") != expected["sha256"]:
+                    if not matches["sha256_header_matches"]:
                         raise PrivateJobError("Private artifact identity mismatch")
+                    stage = "artifact-output-open"
                     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     created = True
                     size, digest = 0, hashlib.sha256()
                     with os.fdopen(fd, "wb") as target:
+                        stage = "artifact-archive-length"
                         while block := response.read(min(1024 * 1024, expected["size"] - size + 1)):
                             size += len(block)
                             if size > expected["size"]:
                                 raise PrivateJobError("Private artifact size limit")
                             target.write(block)
+                            written = size
                             digest.update(block)
-                        if size != expected["size"] or digest.hexdigest() != expected["sha256"]:
+                        if size != expected["size"]:
+                            raise PrivateJobError("Private artifact integrity failure")
+                        stage = "artifact-archive-integrity"
+                        matches["digest_matches"] = digest.hexdigest() == expected["sha256"]
+                        if not matches["digest_matches"]:
                             raise PrivateJobError("Private artifact integrity failure")
                 return
             except BaseException as error:
@@ -702,7 +714,10 @@ class Broker:
                 if isinstance(error, urllib.error.HTTPError):
                     retry = error.code in {404, 409, 429, 500, 502, 503, 504}
                 if not retry or time.monotonic() >= deadline:
-                    raise PrivateJobError("Private artifact unavailable or invalid") from None
+                    failure = PrivateJobError("Private artifact unavailable or invalid")
+                    failure.retained_diagnostic = retained_failure_diagnostic(stage, error, response_status)
+                    failure.retained_diagnostic.update(expected_bytes=expected["size"], written_bytes=written, **matches)
+                    raise failure from None
             time.sleep(min(3, max(0, deadline - time.monotonic())))
 
     def download_retained_artifact(self, output: Path, descriptor: dict, *, wait_seconds=90):
@@ -925,6 +940,13 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
                     if (isinstance(diagnostic.get("worker_error"), str)
                             and diagnostic["worker_error"] in RETAINED_WORKER_ERRORS):
                         safe["worker_error"] = diagnostic["worker_error"]
+                    for key in ("expected_bytes", "written_bytes"):
+                        value = diagnostic.get(key)
+                        if type(value) is int and 0 <= value <= MAX_INPUT_ARTIFACT:
+                            safe[key] = value
+                    for key in ("content_length_matches", "sha256_header_matches", "digest_matches"):
+                        if type(diagnostic.get(key)) is bool:
+                            safe[key] = diagnostic[key]
                     (output / "launcher-diagnostic.json").write_text(json.dumps(safe, sort_keys=True))
             code, status = 1, "error"
         archive = workspace / "results.zip"
