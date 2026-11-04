@@ -640,7 +640,7 @@ class Broker:
         deadline = time.monotonic() + wait_seconds
         while True:
             try:
-                with self.request("/source") as response, output.open("wb") as target:
+                with self.request("/source", deadline=deadline) as response, output.open("wb") as target:
                     announced = response.headers.get("Content-Length")
                     if announced is None or not 0 < int(announced) <= MAX_SOURCE:
                         raise PrivateJobError("Invalid source size")
@@ -661,7 +661,7 @@ class Broker:
                 # A newly pinned job/config may take time to reach the edge.
                 if error.code not in {403, 404, 409, 429, 500, 502, 503, 504} or time.monotonic() >= deadline:
                     raise PrivateJobError("Private source unavailable") from None
-            except urllib.error.URLError:
+            except (urllib.error.URLError, TimeoutError):
                 if time.monotonic() >= deadline:
                     raise PrivateJobError("Private source unavailable") from None
             time.sleep(min(3, max(0, deadline - time.monotonic())))
