@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -52,6 +53,13 @@ MAX_ARTIFACT_IDENTITY = 8 * 1024 ** 2
 MAX_EXPANDED_ARTIFACT = 320 * 1024 ** 2
 MAX_ARTIFACT_FILES = 12_000
 RETAINED_MEMBER = "native/native-audit-app.zip"
+PHASE_FILE = "public-phase.json"
+PRIVATE_PHASES = frozenset({"toolchain", "project-generation", "dependency-resolution", "compile",
+    "code-integrity", "unit-tests", "result-readback", "preboot-fixture", "simulator-boot",
+    "simulator-readiness", "simulator-install", "app-start", "native-observation", "cleanup"})
+LAUNCHER_PHASES = frozenset({"source-transfer", "source-integrity", "artifact-restore", "private-execution",
+    "phase-unavailable", "result-packaging", "result-upload"})
+PHASE_EVENTS = frozenset({"started", "finished"})
 PUBLIC_CLAIMS = ("iss", "aud", "iat", "exp", "nbf", "repository_id", "repository", "ref",
                  "sub", "workflow_ref", "workflow_sha", "run_id", "run_attempt", "actor_id",
                  "event_name")
@@ -276,18 +284,20 @@ def verify_source(broker, expected_sha256: str, temporary_root: Path) -> int:
     return 0
 
 
-def private_environment(source: Path, output: Path, parent=None, *, input_artifact=None) -> dict:
+def private_environment(source: Path, output: Path, parent=None, *, input_artifact=None, phase_control=None) -> dict:
     environment = dict(os.environ if parent is None else parent)
     for name in list(environment):
         if (name.startswith("ACTIONS_") or name in {
                 "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT",
                 "GITHUB_ENV", "GITHUB_PATH", "RUNNER_DEBUG", "PRIVATE_BROKER_URL",
-                "PRIVATE_JOB_ID", "PRIVATE_SOURCE_SHA256", "PRIVATE_INPUT_ARTIFACT"}):
+                "PRIVATE_JOB_ID", "PRIVATE_SOURCE_SHA256", "PRIVATE_INPUT_ARTIFACT", "PRIVATE_PHASE_CONTROL"}):
             environment.pop(name, None)
     environment.update(RESULTS_DIR=str(output), GITHUB_WORKSPACE=str(source),
                        PRIVATE_SOURCE_DIR=str(source))
     if input_artifact is not None:
         environment["PRIVATE_INPUT_ARTIFACT"] = str(input_artifact)
+    if phase_control is not None:
+        environment["PRIVATE_PHASE_CONTROL"] = str(phase_control)
     return environment
 
 
@@ -841,21 +851,174 @@ class Broker:
             delay = min(5, delay * 2)
 
 
-def execute_private(source: Path, output: Path, timeout_seconds: int, *, parent_environment=None,
-                    input_artifact=None) -> int:
-    output.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (output / "entrypoint.log").open("wb") as log:
-        process = subprocess.Popen([sys.executable, str(source / ENTRYPOINT)], cwd=source,
-            env=private_environment(source, output, parent_environment, input_artifact=input_artifact), stdout=log,
-            stderr=subprocess.STDOUT, start_new_session=True)
+def read_private_phase(output: Path):
+    """Read one bounded local enum; private strings never enter public output."""
+    directory_fd, descriptor = None, None
+    try:
+        directory_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent = os.fstat(directory_fd)
+        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+            return None
+        descriptor = os.open(PHASE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600 or not 0 < before.st_size <= 256):
+            return None
+        raw = os.read(descriptor, 257)
+        after, named = os.fstat(descriptor), os.stat(PHASE_FILE, dir_fd=directory_fd, follow_symlinks=False)
+        fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if len(raw) != before.st_size or any(getattr(before, key) != getattr(after, key)
+                or getattr(after, key) != getattr(named, key) for key in fields):
+            return None
+        value = _unique_private_json(raw)
+        if (not isinstance(value, dict) or set(value) != {"schema_version", "phase", "event"}
+                or type(value["schema_version"]) is not int or value["schema_version"] != 1
+                or value["phase"] not in PRIVATE_PHASES or value["event"] not in PHASE_EVENTS):
+            return None
+        return value["phase"], value["event"]
+    except (OSError, ValueError, TypeError, PrivateJobError):
+        return None
+    finally:
+        for owned in (descriptor, directory_fd):
+            if owned is not None:
+                try: os.close(owned)
+                except OSError: pass
+
+
+def write_private_phase(phase, event):
+    """Best-effort enum mirror in launcher-owned control beside private results."""
+    directory_fd, temporary, identity = None, None, None
+    try:
+        if phase not in PRIVATE_PHASES or event not in PHASE_EVENTS:
+            return False
+        output = Path(os.environ.get("PRIVATE_PHASE_CONTROL", ""))
+        results = Path(os.environ.get("RESULTS_DIR", ""))
+        if (not output.is_absolute() or not results.is_absolute() or output.name != "phase-control"
+                or output.parent != results.parent or output == results
+                or ".." in output.parts or ".." in results.parts):
+            return False
+        context = results.lstat()
+        if (not stat.S_ISDIR(context.st_mode) or context.st_uid != os.getuid()
+                or stat.S_IMODE(context.st_mode) & 0o077):
+            return False
+        directory_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent = os.fstat(directory_fd)
+        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+            return False
         try:
+            existing = os.stat(PHASE_FILE, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.getuid()
+                or existing.st_nlink != 1 or stat.S_IMODE(existing.st_mode) != 0o600):
+            return False
+        raw = json.dumps({"schema_version": 1, "phase": phase, "event": event},
+                         sort_keys=True, separators=(",", ":")).encode()
+        if len(raw) > 256:
+            return False
+        temporary = ".private-ci-phase-" + uuid.uuid4().hex
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory_fd)
+        with os.fdopen(descriptor, "wb") as stream:
+            info = os.fstat(stream.fileno()); identity = info.st_dev, info.st_ino
+            os.fchmod(stream.fileno(), 0o600)
+            if stream.write(raw) != len(raw):
+                return False
+        os.replace(temporary, PHASE_FILE, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    finally:
+        if directory_fd is not None:
+            if temporary is not None and identity is not None:
+                try:
+                    info = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+                    if (info.st_dev, info.st_ino) == identity:
+                        os.unlink(temporary, dir_fd=directory_fd)
+                except OSError: pass
+            try: os.close(directory_fd)
+            except OSError: pass
+
+
+def public_phase(phase, event, started):
+    if (not isinstance(phase, str) or not isinstance(event, str)
+            or phase not in PRIVATE_PHASES | LAUNCHER_PHASES or event not in PHASE_EVENTS):
+        return
+    try:
+        elapsed = max(0, min(86400, int(time.monotonic() - started)))
+        row = json.dumps({"phase": phase, "event": event, "elapsed_seconds": elapsed}, sort_keys=True)
+        sys.stdout.write(row + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass  # Console observation must not alter a private result.
+
+
+def observe_private_phase(control, started, child_started, stopped):
+    """Optional daemon observations; this worker never decides a child outcome."""
+    try:
+        child_started.wait()
+        if stopped.is_set():
+            return
+        observed, heartbeat = ("private-execution", "started"), time.monotonic() + 60
+        if stopped.is_set():
+            return
+        public_phase(*observed, started)
+        while not stopped.is_set():
+            current = read_private_phase(control) if control is not None else None
+            if stopped.is_set():
+                return
+            if current is None:
+                current = observed if observed == ("private-execution", "started") else ("phase-unavailable", "started")
+            now = time.monotonic()
+            if current != observed or now >= heartbeat:
+                if stopped.is_set():
+                    return
+                public_phase(*current, started)
+                observed, heartbeat = current, now + 60
+            stopped.wait(15)
+    except BaseException:
+        pass  # threading must never render private exception text or affect CI.
+
+
+def execute_private(source: Path, output: Path, timeout_seconds: int, *, parent_environment=None,
+                    input_artifact=None, progress_started=None) -> int:
+    output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    control = output.parent / "phase-control"
+    try:
+        control.mkdir(mode=0o700)
+    except OSError:
+        control = None  # Never reuse an existing observation channel.
+    with (output / "entrypoint.log").open("wb") as log:
+        stopped, child_started = None, None
+        try:
+            stopped, child_started = threading.Event(), threading.Event()
+            started = time.monotonic() if progress_started is None else progress_started
+            observer = threading.Thread(target=observe_private_phase,
+                args=(control, started, child_started, stopped), daemon=True)
+            observer.start()  # Observer startup spends no running-child deadline.
+        except BaseException as error:
+            if stopped is not None: stopped.set()
+            if child_started is not None: child_started.set()
+            if isinstance(error, PrivateJobError) or not isinstance(error, Exception):
+                raise
+            stopped, child_started = None, None
+        process = None
+        try:
+            process = subprocess.Popen([sys.executable, str(source / ENTRYPOINT)], cwd=source,
+                env=private_environment(source, output, parent_environment, input_artifact=input_artifact,
+                                        phase_control=control), stdout=log,
+                stderr=subprocess.STDOUT, start_new_session=True)
+            if child_started is not None: child_started.set()
             code = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            terminate_private(process)
+            if process is not None: terminate_private(process)
             code = 124
         except BaseException:
-            terminate_private(process)
+            if process is not None: terminate_private(process)
             raise
+        finally:
+            if stopped is not None: stopped.set()
+            if child_started is not None: child_started.set()
     return max(0, min(255, code if code >= 0 else 128 - code))
 
 
@@ -903,6 +1066,7 @@ def result_archive(output: Path, destination: Path) -> None:
 
 def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_root: Path) -> int:
     code, status = 1, "error"
+    started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="private-native-job-", dir=temporary_root) as name:
         workspace = Path(name)
         workspace.chmod(0o700)
@@ -910,21 +1074,30 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
         output.mkdir(mode=0o700)
         try:
             archive = workspace / "source.zip"
+            public_phase("source-transfer", "started", started)
             broker.download(archive, expected_sha256)
+            public_phase("source-transfer", "finished", started)
             source = workspace / "source"
+            public_phase("source-integrity", "started", started)
             extract_source(archive, source)
+            public_phase("source-integrity", "finished", started)
             transport = read_artifact_transport(source)
             descriptor = read_artifact_descriptor(source)
             artifact = None
             if transport is not None:
                 outer = workspace / "private-retained-input.zip"
                 artifact = workspace / "private-input.zip"
+                public_phase("artifact-restore", "started", started)
                 broker.download_retained_artifact(outer, transport)
                 extract_retained_artifact(outer, artifact, transport, source / ARTIFACT_IDENTITY)
+                public_phase("artifact-restore", "finished", started)
             elif descriptor is not None:
                 artifact = workspace / "private-input.zip"
+                public_phase("artifact-restore", "started", started)
                 broker.download_artifact(artifact, descriptor)
-            code = execute_private(source, output, timeout_seconds, input_artifact=artifact)
+                public_phase("artifact-restore", "finished", started)
+            code = execute_private(source, output, timeout_seconds, input_artifact=artifact, progress_started=started)
+            public_phase("private-execution", "finished", started)
             status = "pass" if code == 0 else "fail"
         except BaseException as error:
             # The private log is the only place an error may contain job data.
@@ -950,8 +1123,12 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
                     (output / "launcher-diagnostic.json").write_text(json.dumps(safe, sort_keys=True))
             code, status = 1, "error"
         archive = workspace / "results.zip"
+        public_phase("result-packaging", "started", started)
         result_archive(output, archive)
+        public_phase("result-packaging", "finished", started)
+        public_phase("result-upload", "started", started)
         broker.upload(archive, code, status)
+        public_phase("result-upload", "finished", started)
     return code
 
 
