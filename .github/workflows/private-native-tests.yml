@@ -23,8 +23,8 @@ jobs:
     timeout-minutes: 60
     env:
       PRIVATE_BROKER_URL: https://native-ci-broker.evinsta9.workers.dev
-      PRIVATE_JOB_ID: ec4393d9-f059-40b8-9db1-eae35849b058
-      PRIVATE_SOURCE_SHA256: ad89bd1285ae86aead41559d377e613746f773f51d11fc4c47cfdf9a02e1b07d
+      PRIVATE_JOB_ID: e395d96c-f5ea-49a3-a5b2-07d0a23a9d35
+      PRIVATE_SOURCE_SHA256: 0e55f56f4d7f36b49c0111bbfd51c9337a18da38559b192275c160c238484ce2
       PRIVATE_PREFLIGHT_ONLY: 'false'
       PRIVATE_VERIFY_SOURCE: 'false'
     steps:
