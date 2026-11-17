@@ -147,6 +147,7 @@ def diagnostic_failure(stage: str, error: BaseException) -> dict:
 
 
 RETAINED_DIAGNOSTIC_STAGES = frozenset({
+    "source-request", "source-response-identity", "source-output-open", "source-archive-length", "source-archive-integrity",
     "artifact-request", "artifact-response-identity", "artifact-output-open",
     "artifact-part-length", "artifact-part-integrity", "artifact-archive-length", "artifact-archive-integrity",
 })
@@ -154,8 +155,19 @@ RETAINED_WORKER_ERRORS = frozenset({
     "invalid_json", "body_too_large", "invalid_token", "unauthorized", "identity_unavailable",
     "unknown_signing_key", "run_not_allowed", "job_pending", "not_found", "job_expired",
     "invalid_job_configuration", "job_expiring", "internal_error", "artifact_pending",
-    "artifact_not_configured", "result_storage_unavailable", "invalid_artifact_transport",
+    "artifact_not_configured", "result_storage_unavailable", "invalid_artifact_transport", "source_pending",
+    "source_part_length_mismatch", "source_part_integrity_mismatch",
 })
+RETAINED_FAILURE_CATEGORIES = frozenset({"http", "transport", "timeout", "invalid-response", "integrity", "output", "deadline"})
+
+
+def retained_correlation(headers):
+    """Only opaque, bounded IDs from named headers; never a URL or error body."""
+    headers = headers or {}
+    ray = headers.get("CF-Ray")
+    if isinstance(ray, str) and re.fullmatch(r"[a-fA-F0-9]{16}(?:-[A-Za-z]{3})?", ray):
+        return {"cf_ray": ray}
+    return {}
 
 
 def retained_failure_diagnostic(stage, error, http_status=None):
@@ -169,6 +181,8 @@ def retained_failure_diagnostic(stage, error, http_status=None):
         reported = (error.headers or {}).get("X-Private-CI-Error")
         if isinstance(reported, str) and reported in RETAINED_WORKER_ERRORS:
             value["worker_error"] = reported
+        if value["stage"].startswith("source-"):
+            value.update(retained_correlation(error.headers))
     return value
 
 
@@ -260,7 +274,6 @@ def verify_source(broker, expected_sha256: str, temporary_root: Path) -> int:
             directory = Path(name)
             directory.chmod(0o700)
             path = directory / "source.zip"
-            path.touch(mode=0o600, exist_ok=False)
             try:
                 broker.download(path, expected_sha256)
                 count = path.stat().st_size
@@ -647,33 +660,72 @@ class Broker:
     def download(self, output: Path, expected_sha256: str, *, wait_seconds=180):
         if not HEX.fullmatch(expected_sha256):
             raise PrivateJobError("Invalid source fingerprint")
+        if output.exists() or output.is_symlink():
+            raise PrivateJobError("Private source output already exists")
         deadline = time.monotonic() + wait_seconds
+        diagnostic = {"stage": "source-request", "failure_category": "deadline"}
         while True:
+            if time.monotonic() >= deadline:
+                failure = PrivateJobError("Private source unavailable")
+                failure.retained_diagnostic = diagnostic
+                raise failure from None
+            created, response_status, written = False, None, 0
+            stage, correlation = "source-request", {}
             try:
-                with self.request("/source", deadline=deadline) as response, output.open("wb") as target:
-                    announced = response.headers.get("Content-Length")
-                    if announced is None or not 0 < int(announced) <= MAX_SOURCE:
+                with self.request("/source", deadline=deadline) as response:
+                    stage, response_status = "source-response-identity", response.status
+                    correlation = retained_correlation(response.headers)
+                    announced = response.headers.get("Content-Length", "")
+                    if response_status != 200 or not re.fullmatch(r"[1-9][0-9]{0,7}", announced) or int(announced) > MAX_SOURCE:
                         raise PrivateJobError("Invalid source size")
                     if response.headers.get("X-Content-Sha256") != expected_sha256:
                         raise PrivateJobError("Source identity mismatch")
+                    stage = "source-output-open"
+                    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    created = True
                     size, digest = 0, hashlib.sha256()
-                    while block := response.read(1024 * 1024):
-                        size += len(block)
-                        if size > MAX_SOURCE:
-                            raise PrivateJobError("Source size limit")
-                        target.write(block)
-                        digest.update(block)
-                    if size != int(announced) or digest.hexdigest() != expected_sha256:
-                        raise PrivateJobError("Source integrity failure")
-                output.chmod(0o600)
+                    with os.fdopen(descriptor, "wb") as target:
+                        stage = "source-archive-length"
+                        while True:
+                            remaining_timeout(deadline, 60)
+                            block = response.read(min(1024 * 1024, int(announced) - size + 1))
+                            remaining_timeout(deadline, 60)
+                            if not block:
+                                break
+                            size += len(block)
+                            if size > int(announced):
+                                raise PrivateJobError("Source size limit")
+                            target.write(block)
+                            written = size
+                            digest.update(block)
+                        stage = "source-archive-integrity"
+                        if size != int(announced) or digest.hexdigest() != expected_sha256:
+                            raise PrivateJobError("Source integrity failure")
+                remaining_timeout(deadline, 60)
                 return
-            except urllib.error.HTTPError as error:
-                # A newly pinned job/config may take time to reach the edge.
-                if error.code not in {403, 404, 409, 429, 500, 502, 503, 504} or time.monotonic() >= deadline:
-                    raise PrivateJobError("Private source unavailable") from None
-            except (urllib.error.URLError, TimeoutError):
-                if time.monotonic() >= deadline:
-                    raise PrivateJobError("Private source unavailable") from None
+            except BaseException as error:
+                if created:
+                    output.unlink(missing_ok=True)
+                retry = isinstance(error, (urllib.error.URLError, http.client.IncompleteRead,
+                    http.client.RemoteDisconnected, ConnectionResetError, TimeoutError))
+                category = "transport" if retry else {"source-request": "invalid-response", "source-response-identity": "invalid-response",
+                    "source-output-open": "output", "source-archive-length": "integrity",
+                    "source-archive-integrity": "integrity"}.get(stage, "deadline")
+                if isinstance(error, PrivateJobError) and str(error) == "Private transfer deadline":
+                    category = "deadline"
+                if isinstance(error, TimeoutError):
+                    category = "timeout"
+                if isinstance(error, urllib.error.HTTPError):
+                    category = "http"
+                    retry = error.code in {404, 409, 429, 500, 502, 503, 504}
+                diagnostic = retained_failure_diagnostic(stage, error, response_status)
+                diagnostic.update(correlation, failure_category=category, written_bytes=written)
+                if diagnostic.get("worker_error") in {"invalid_token", "unauthorized", "unknown_signing_key", "run_not_allowed"}:
+                    retry = False
+                if not retry or time.monotonic() >= deadline:
+                    failure = PrivateJobError("Private source unavailable")
+                    failure.retained_diagnostic = diagnostic
+                    raise failure from None
             time.sleep(min(3, max(0, deadline - time.monotonic())))
 
     def download_artifact(self, output: Path, descriptor: dict, *, wait_seconds=90):
@@ -980,8 +1032,75 @@ def observe_private_phase(control, started, child_started, stopped):
         pass  # threading must never render private exception text or affect CI.
 
 
+def read_private_live_status(output):
+    """Read only the owned, atomic diagnostic snapshot, never arbitrary paths."""
+    directory_fd, descriptor = None, None
+    try:
+        directory_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent = os.fstat(directory_fd)
+        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+            return None
+        name = "private-live-status.json"
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600 or not 0 < before.st_size <= 12 * 1024):
+            return None
+        raw = os.read(descriptor, 12 * 1024 + 1)
+        after, named = os.fstat(descriptor), os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if len(raw) != before.st_size or any(getattr(before, key) != getattr(after, key)
+                or getattr(after, key) != getattr(named, key) for key in fields):
+            return None
+        value = _unique_private_json(raw)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError, PrivateJobError):
+        return None
+    finally:
+        for owned in (descriptor, directory_fd):
+            if owned is not None:
+                try: os.close(owned)
+                except OSError: pass
+
+
+def relay_private_status(output, broker, source_sha256, child_started, stopped):
+    """Best-effort private diagnostics; never control or report a child outcome."""
+    try:
+        job_id = urllib.parse.urlsplit(broker.base).path.rsplit("/", 1)[-1]
+        run_id = broker.environment.get("GITHUB_RUN_ID", "")
+        run_attempt = broker.environment.get("GITHUB_RUN_ATTEMPT", "")
+        if (str(uuid.UUID(job_id)) != job_id or not isinstance(source_sha256, str)
+                or HEX.fullmatch(source_sha256) is None
+                or re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None
+                or re.fullmatch(r"[1-9][0-9]{0,8}", run_attempt) is None):
+            return
+        child_started.wait()
+        sequence = 0
+        while not stopped.is_set():
+            try:
+                observation = read_private_live_status(output)
+                if observation is not None and not stopped.is_set():
+                    observed_at = observation.get("observed_at")
+                    if type(observed_at) is not int or not 0 < observed_at <= int(time.time()) + 30:
+                        raise ValueError("Invalid private observation timestamp")
+                    sequence += 1
+                    payload = json.dumps({"schema_version": 1, "job_id": job_id,
+                        "source_sha256": source_sha256, "run_id": run_id, "run_attempt": run_attempt,
+                        "sequence": sequence, "observed_at": observed_at, "observation": observation},
+                        separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+                    if len(payload) <= 16 * 1024 and not stopped.is_set():
+                        with broker.request("/status", method="POST", data=payload,
+                                headers={"Content-Type": "application/json"}, deadline=time.monotonic() + 5):
+                            pass  # No response body or retry is needed for observation.
+            except BaseException:
+                pass  # No retries, console output, or influence on the archive.
+            stopped.wait(60)
+    except BaseException:
+        pass
+
+
 def execute_private(source: Path, output: Path, timeout_seconds: int, *, parent_environment=None,
-                    input_artifact=None, progress_started=None) -> int:
+                    input_artifact=None, progress_started=None, broker=None, source_sha256=None) -> int:
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     control = output.parent / "phase-control"
     try:
@@ -996,6 +1115,12 @@ def execute_private(source: Path, output: Path, timeout_seconds: int, *, parent_
             observer = threading.Thread(target=observe_private_phase,
                 args=(control, started, child_started, stopped), daemon=True)
             observer.start()  # Observer startup spends no running-child deadline.
+            if broker is not None:
+                try:
+                    threading.Thread(target=relay_private_status,
+                        args=(output, broker, source_sha256, child_started, stopped), daemon=True).start()
+                except BaseException:
+                    pass
         except BaseException as error:
             if stopped is not None: stopped.set()
             if child_started is not None: child_started.set()
@@ -1096,7 +1221,8 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
                 public_phase("artifact-restore", "started", started)
                 broker.download_artifact(artifact, descriptor)
                 public_phase("artifact-restore", "finished", started)
-            code = execute_private(source, output, timeout_seconds, input_artifact=artifact, progress_started=started)
+            code = execute_private(source, output, timeout_seconds, input_artifact=artifact, progress_started=started,
+                                   broker=broker, source_sha256=expected_sha256)
             public_phase("private-execution", "finished", started)
             status = "pass" if code == 0 else "fail"
         except BaseException as error:
@@ -1113,6 +1239,10 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
                     if (isinstance(diagnostic.get("worker_error"), str)
                             and diagnostic["worker_error"] in RETAINED_WORKER_ERRORS):
                         safe["worker_error"] = diagnostic["worker_error"]
+                    if diagnostic.get("failure_category") in RETAINED_FAILURE_CATEGORIES:
+                        safe["failure_category"] = diagnostic["failure_category"]
+                    if isinstance(diagnostic.get("cf_ray"), str):
+                        safe.update(retained_correlation({"CF-Ray": diagnostic["cf_ray"]}))
                     for key in ("expected_bytes", "written_bytes"):
                         value = diagnostic.get(key)
                         if type(value) is int and 0 <= value <= MAX_INPUT_ARTIFACT:
