@@ -20,11 +20,11 @@ concurrency:
 jobs:
   private-job:
     runs-on: xcode-27
-    timeout-minutes: 60
+    timeout-minutes: 8
     env:
       PRIVATE_BROKER_URL: https://native-ci-broker.evinsta9.workers.dev
-      PRIVATE_JOB_ID: 86af254d-378c-421b-8b65-78f21e85fa8c
-      PRIVATE_SOURCE_SHA256: cca8aca76cb00f3561c20d0ba6500a0d9323178ba1bd0672a0bb8a3b1be21c65
+      PRIVATE_JOB_ID: 956d14f1-d260-4182-9c57-53a1bfeb782d
+      PRIVATE_SOURCE_SHA256: 877c789ef63bc628c8531b8e73864380342b6807231a646f67b70a52e38ee148
       PRIVATE_PREFLIGHT_ONLY: 'false'
       PRIVATE_VERIFY_SOURCE: 'false'
     steps:
@@ -55,7 +55,7 @@ jobs:
           set -- --broker "$PRIVATE_BROKER_URL" \
             --job "$PRIVATE_JOB_ID" \
             --source-sha256 "$PRIVATE_SOURCE_SHA256" \
-            --timeout-seconds 3000
+            --timeout-seconds 360
           if [ "$PRIVATE_PREFLIGHT_ONLY" = 'true' ]; then
             set -- "$@" --verify-access
             if [ "$PRIVATE_VERIFY_SOURCE" = 'true' ]; then
