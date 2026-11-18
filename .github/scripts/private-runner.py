@@ -1189,7 +1189,27 @@ def result_archive(output: Path, destination: Path) -> None:
         raise PrivateJobError("Private result archive limit")
 
 
-def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_root: Path) -> int:
+def validate_execution_budget(source: Path, timeout_seconds: int, device_archive_budget: bool) -> None:
+    if not device_archive_budget:
+        if not 1 <= timeout_seconds <= 3000:
+            raise PrivateJobError("Invalid job timeout")
+        return
+    if timeout_seconds != 4200:
+        raise PrivateJobError("Invalid device archive timeout")
+    path = source / "bundle-provenance.json"
+    if path.is_symlink() or not path.is_file() or not 1 <= path.stat().st_size <= 4 * 1024 ** 2:
+        raise PrivateJobError("Device archive authorization unavailable")
+    value = _unique_private_json(path.read_bytes())
+    descriptor = value.get("production_validation") if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or value.get("ci_suite") != "native-production-validation"
+            or descriptor != {"schema_version": 1, "mode": "ios-device-release"}
+            or type(descriptor.get("schema_version")) is not int
+            or value.get("production_archive_only") is not True):
+        raise PrivateJobError("Extended budget requires the explicit production device archive")
+
+
+def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_root: Path,
+        *, device_archive_budget: bool = False) -> int:
     code, status = 1, "error"
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="private-native-job-", dir=temporary_root) as name:
@@ -1205,6 +1225,7 @@ def run(broker: Broker, expected_sha256: str, timeout_seconds: int, temporary_ro
             source = workspace / "source"
             public_phase("source-integrity", "started", started)
             extract_source(archive, source)
+            validate_execution_budget(source, timeout_seconds, device_archive_budget)
             public_phase("source-integrity", "finished", started)
             transport = read_artifact_transport(source)
             descriptor = read_artifact_descriptor(source)
@@ -1268,6 +1289,8 @@ def main(argv=None) -> int:
     parser.add_argument("--job", required=True)
     parser.add_argument("--source-sha256", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=3000)
+    parser.add_argument("--device-archive-budget", action="store_true",
+                        help="Use the fixed extended envelope only for a verified archive-only device job.")
     parser.add_argument("--verify-access", action="store_true",
                         help="Print allowlisted public OIDC identity fields and HEAD status; no private job execution.")
     parser.add_argument("--verify-source", action="store_true",
@@ -1277,9 +1300,10 @@ def main(argv=None) -> int:
         def cancelled(_number, _frame):
             raise PrivateJobError("Job cancelled")
         signal.signal(signal.SIGTERM, cancelled)
-        # Keep a ten-minute nominal margin in the sixty-minute workflow for
-        # source pinning, packing and authenticated private-result transfer.
-        if not 1 <= args.timeout_seconds <= 3000:
+        # Ordinary jobs keep their original envelope. The separate device
+        # archive workflow grants only the exact, privately verified extension.
+        if (args.device_archive_budget and args.timeout_seconds != 4200
+                or not args.device_archive_budget and not 1 <= args.timeout_seconds <= 3000):
             raise PrivateJobError("Invalid job timeout")
         if args.verify_source and not args.verify_access:
             print(json.dumps({"stage": "preflight-context", "type": "InvalidContext"}))
@@ -1292,7 +1316,8 @@ def main(argv=None) -> int:
             temporary = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
             return verify_source(transfer, args.source_sha256, temporary)
         temporary = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
-        code = run(transfer, args.source_sha256, args.timeout_seconds, temporary)
+        options = {"device_archive_budget": True} if args.device_archive_budget else {}
+        code = run(transfer, args.source_sha256, args.timeout_seconds, temporary, **options)
     except BaseException:
         if args.verify_access:
             # Arguments contain only public launcher configuration, but avoid
