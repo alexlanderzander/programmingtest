@@ -1,6 +1,6 @@
 # Publish these contents at the existing public destination
 # .github/workflows/private-native-tests.yml. Do not create a second workflow.
-name: Private native validation launcher
+name: Private device archive launcher
 
 on:
   push:
@@ -22,11 +22,11 @@ concurrency:
 jobs:
   private-job:
     runs-on: xcode-27
-    timeout-minutes: 60
+    timeout-minutes: 80
     env:
       PRIVATE_BROKER_URL: https://native-ci-broker.evinsta9.workers.dev
-      PRIVATE_JOB_ID: 0a6fad1f-8e33-4b4b-b87d-90e629afa923
-      PRIVATE_SOURCE_SHA256: beadbf16171e5d1b858cf303945f64dfedd116f2c479e94c89ffd47ef558697c
+      PRIVATE_JOB_ID: 6a3d6b00-be81-4be2-b248-b6bb961d1c11
+      PRIVATE_SOURCE_SHA256: 69a385a566552fdc114c4d0f8c7f5b62833a8f97b3d464ca0dd97dc0ff9252e7
       PRIVATE_PREFLIGHT_ONLY: 'false'
       PRIVATE_VERIFY_SOURCE: 'false'
     steps:
@@ -56,7 +56,8 @@ jobs:
           set -eu
           set -- --broker "$PRIVATE_BROKER_URL" \
             --job "$PRIVATE_JOB_ID" \
-            --source-sha256 "$PRIVATE_SOURCE_SHA256"
+            --source-sha256 "$PRIVATE_SOURCE_SHA256" \
+            --device-archive-budget --timeout-seconds 4200
           if [ "$PRIVATE_PREFLIGHT_ONLY" = 'true' ]; then
             set -- "$@" --verify-access
             if [ "$PRIVATE_VERIFY_SOURCE" = 'true' ]; then
